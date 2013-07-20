@@ -1,0 +1,725 @@
+#!/usr/bin/env python
+# -*- coding: utf-8; mode: python; -*-
+
+##  Copyright 2010-13 by Diedrich Vorberg <diedrich@tux4web.de>
+##
+##  All Rights Reserved
+##
+##  For more Information on orm see the README file.
+##
+##  This program is free software; you can redistribute it and/or modify
+##  it under the terms of the GNU General Public License as published by
+##  the Free Software Foundation; either version 3 of the License, or
+##  (at your option) any later version.
+##
+##  This program is distributed in the hope that it will be useful,
+##  but WITHOUT ANY WARRANTY; without even the implied warranty of
+##  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+##  GNU General Public License for more details.
+##
+##  You should have received a copy of the GNU General Public License
+##  along with this program; if not, write to the Free Software
+##  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+##
+##  I have added a copy of the GPL in the file LICENSE
+
+import sys, os, os.path, optparse, lxml.etree, re, subprocess, types, urllib
+from string import *
+from t4.debug import log, debug
+
+options = None
+
+soundtrack_option_re = re.compile(r"([a-z]{3})=(\d+)")
+
+class set_once_dict(dict):
+    def __setitem__(self, key, value):
+        if self.has_key(key):
+            return
+        else:
+            self.set(key, value)
+
+    def update(self, other):
+        for key, value in other.iteritems():
+            self[key] = value
+
+    def set(self, key, value):
+        """
+        Set a value, overwriting if present.
+        """
+        dict.__setitem__(self, key, value)
+
+def report(msg):
+    if options.growl:
+        os.system("growlnotify -s -m %s" % add_quotes_q(msg))
+    else:
+        print >> log, msg
+
+def name_and_year(filename):
+    """
+    Return a tuple a ( name, int(year), ). year may be None.
+    """
+    filename_re = re.compile(r"(.*?)\((\d+)\)\..*")
+    match = filename_re.match(filename)
+    if match is not None:
+        name, year = match.groups()
+        return ( strip(name), int(year),  )
+    else:
+        try:
+            name, ext = split(filename, ".", 1)
+        except ValueError:
+            name = filename
+        
+        return ( strip(name), None, )
+
+
+def present_movie(idx, movie):
+    print idx,
+    print "%(title)s (%(release_date)s)" % movie
+    
+def download_movie_metadata(fn, title=None):
+    if title is None:
+        title = fn
+
+    try:
+        import tmdb
+    except ImportError:
+        print >> sys.stderr, \
+            ("Can't import tmdb Python module. Please install.\n"
+             "E.g by running 'easy_install tmdb' on the command line.\n"
+             "See http://www.themoviedb.org/documentation/api on how to\n"
+             "obtain the required API key.")
+        sys.exit(255)
+        
+    tmdb.configure("a888a20b801aeefde1ba41a932898d48")
+
+    name, year = name_and_year(title)
+
+    result = tmdb.Movies(name)
+    
+    movies = list(result.iter_results())
+
+    if year is not None:
+        def year_match(movie):
+            if not movie["release_date"]: return False
+            y, m, d = split(movie["release_date"], "-")
+            y = int(y)
+            return y == year or y == year - 1 or y == year + 1
+        
+        movies = filter(year_match, movies)
+
+    if len(movies) == 0:
+        print >> sys.stderr, "No movie found:", name
+        sys.exit(1)
+    elif len(movies) > 1:
+        
+        print
+        for idx, movie in enumerate(movies):
+            present_movie(idx, movie)
+        print
+        
+        if options.choose is None:
+            if fn == "-":
+                print "Use --choose to select one of the movies above."
+                sys.exit(1)
+            else:
+                print "Enter index [0]:",
+                i = strip(raw_input())
+                if i == "":
+                    idx = 0
+                else:
+                    idx = int(i)
+        else:
+            idx = int(options.choose)
+    else:
+        idx = 0
+
+    movie = tmdb.Movie(movies[idx]["id"])
+
+    if movie.movies["tagline"] is None:
+        movie.movies["tagline"] = ""
+        
+    if movie.movies["overview"] is None:
+        movie.movies["overview"] = ""
+
+    if strip(movie.movies["tagline"]):
+        description = movie.movies["tagline"] + \
+            u" — " + movie.movies["overview"]
+    else:
+        description = movie.movies["overview"]
+
+    # Download artwork
+    if not options.art:
+        url = movie.get_poster()
+        rest, artfn = rsplit(url, "/", 1)
+        artpath = os.path.join("/tmp", artfn)
+
+        if not os.path.exists(artpath):
+            jpeg = urllib.urlopen(url).read()        
+            fp = open(artpath, "w")
+            fp.write(jpeg)
+            fp.close()
+            
+        options.art = artpath
+
+    genre = map(lambda d: d["name"], movie.get_genres())
+    genre = join(genre, ", ")
+        
+    info = { "song": movie.movies["title"],
+             "description": description, "genre": genre}
+    if movie.movies["release_date"]:
+        info["year"] = movie.movies["release_date"].split("-")[0]
+
+    return info
+    
+def download_tvshow_metadata(fn, metadata):
+    try:
+        import tvdb_api
+        from tvdb_exceptions import tvdb_shownotfound
+    except ImportError:
+        print >> sys.stderr, \
+            ("Can't import tvdb_api Python module. Please install.\n"
+             "E.g by running 'easy_install tvdb_api' on the command line.\n"
+             "See http://thetvdb.com/wiki/index.php?title=Programmers_API\n"
+             "on how to obtain the required API key.")
+        sys.exit(255)
+
+
+    tvshow_filename_regexs = map(lambda s: re.compile(s, re.IGNORECASE), (
+        # The Simpsons (1989).S01E10.Simpsons Roasting on an Open Fire.vob
+        (r"(?P<show>.*?)\((?P<year>\d+)\)\."
+         r"S(?P<season>\d+)E(?P<episode>\d+)\."
+         r"(?P<song>.*?)\."
+         r"[\w]+"),
+        # The Simpsons.S01E10.Simpsons Roasting on an Open Fire.vob
+        (r"(?P<show>.*?)\."
+         r"S(?P<season>\d+)E(?P<episode>\d+)\."
+         r"(?P<song>.*?)\."
+         r"[\w]+"),
+        # S01E10.The Simpsons Roasting on an Open Fire.vob
+        (r"S(?P<season>\d+)E(?P<episode>\d+)\."
+         r"(?P<song>.*?)\."
+         r"[\w]+"),
+        # S01E10
+        r"S(?P<season>\d+)E(?P<episode>\d+)", ))
+
+    # Combine the metadata. The metadata provided by the user manually
+    # takes precidence.
+    for regex in tvshow_filename_regexs:
+        result = regex.search(fn)
+        if result is not None:
+            metadata.update(result.groupdict())
+            break
+
+    # If the metadata doesn't contain season and episode numbers, we can't
+    # download anything.
+    try:
+        show_name = metadata["show"]
+        season_no = int(metadata["season"])
+        episode_no = int(metadata["episode"])
+    except (KeyError, ValueError,):
+        print >> log, ("Need show name, season and episode number to "
+                       "download metadata.")
+        return {}
+    
+    tvdb = tvdb_api.Tvdb(interactive = False,
+                         select_first = False,
+                         debug = False,
+                         cache = True,
+                         banners = False,
+                         actors = False,
+                         custom_ui = None,
+                         language = None, # get from os.environ?
+                         search_all_languages = False,
+                         apikey = "38D14E6C027D622A",
+                         forceConnect=False,
+                         useZip=False)
+
+    try:
+        # I'm surprised the mapping semantic is the only public interface
+        # of the Tvdb class. 
+        show = tvdb[metadata["show"]]
+    except tvdb_shownotfound:
+        print >> log, "Show '%(show)s' not found." % metadata
+        return metadata
+
+    metadata["show"] = show.data["seriesname"]
+    metadata["network"] = show.data["network"]
+    
+    season = show[season_no]
+    episode = season[episode_no]
+
+    metadata["song"] = episode["episodename"]
+    metadata["description"] = episode["overview"]
+    metadata["year"] = episode["firstaired"].split("-")[0]
+        
+
+    # lines = []
+    
+    # keys = show.data.keys()
+    # keys.sort()
+    # for key in keys:
+    #     lines.append("%s: %s" % ( key, show.data[key], ))
+
+    # lines.append("")
+        
+    # keys = episode.keys()
+    # keys.sort()
+    # for key in keys:
+    #     lines.append("%s: %s" % ( key, episode[key], ))
+
+    # lines.append("")
+    
+    # metadata["comment"] = join(lines, "\n")
+
+    
+    # Download artwork
+    #if not options.art:
+    #    url = episode
+    #    rest, artfn = rsplit(url, "/", 1)
+    #    artpath = os.path.join("/tmp", artfn)
+
+    #    if not os.path.exists(artpath):
+    #        jpeg = urllib.urlopen(url).read()        
+    #        fp = open(artpath, "w")
+    #        fp.write(jpeg)
+    #        fp.close()
+            
+    #    options.art = artpath
+
+    
+    return metadata
+    
+    
+def new_ext(fn, newext):
+    if "." in fn:
+        name, ext = rsplit(fn, ".", 1)
+    else:
+        name = fn
+    return name + "." + newext
+
+
+mp4tags_field_re = re.compile("^\s+-[A-Za-z],\s+-([a-z]+)\s+([A-Z]+)\s+(.*)$",
+                              re.MULTILINE)
+def ask_mp4tags_for_tags():
+    p = subprocess.Popen(["mp4tags", "--help",], stderr=subprocess.PIPE)
+    stdout, stderr = p.communicate()
+
+    return mp4tags_field_re.findall(stderr)
+
+# meta_tags -> [ ( name, type, help, ), ... ]
+meta_tags = ask_mp4tags_for_tags()
+meta_tag_names = map(lambda tpl: tpl[0], meta_tags)
+
+nfo_fields_to_tags = {  "title": "song",
+                        "season": "season",
+                        "episode": "episode",
+                        "plot": "description",
+                        "director": "artist",
+                        "aired": "year", }
+
+media_type_by_name = { "music": 1,
+                       "audiobook": 2,
+                       "musicvideo": 6,
+                       "movie": 9,
+                       "tvshow": 10,
+                       "booklet": 11,
+                       "ringtone": 14, }
+
+media_type_by_stik = dict(map(lambda tpl: (tpl[1], tpl[0],),
+                              media_type_by_name.items()))
+
+
+def read_nfo(nfo_fn):
+    """
+    Read the nfo file and return mp4tags-compatible field names.
+    """
+    dom = lxml.etree.parse(open(nfo_fn))
+    def get(tag):
+        try:
+            return dom.xpath("string(/episodedetails/%s)" % tag)
+        except Exception, e:
+            return None
+    
+    return dict(map(lambda field: ( nfo_fields_to_tags[field], get(field), ),
+                    nfo_fields_to_tags.keys()))
+    
+            
+def add_quotes_q(s):
+    s = replace(s, '"', "'")
+    if " " in s: return '"' + s + '"'
+    else: return s
+
+def run(cmd):
+    if type(cmd) == types.ListType:
+        cmd = join(map(add_quotes_q, cmd), " ")
+
+    print cmd
+    
+    if debug.verbose:
+        print
+    else:
+        retval = os.system(cmd)
+        if retval:
+            report("Command execution failed: " + cmd)
+            sys.exit(retval)
+
+def write_metadata(metadata, outfn):
+    cmd = [ "mp4tags", ]
+    for key, value in metadata.items():
+        if value:
+            cmd.append("-" + key)
+            cmd.append(value)
+
+    cmd.append(outfn)
+        
+    run(cmd)
+    
+        
+def write_art(outfn):
+    run('mp4art --add "%s" "%s"' % ( options.art, outfn, ))
+
+def aac_codec_name():
+    p = subprocess.Popen(["ffmpeg", "--codecs",], stdout=subprocess.PIPE)
+    stdout, stderr = p.communicate()
+
+    if "libfaac" in stdout:
+        return [ "libfaac", ]
+    else:
+        return [ "aac", "-strict", "-2", ]
+
+def run_ffmpeg(fn, outfn, metadata):
+    ffmpeg = [ ]
+
+    if options.nice:
+        ffmpeg += [ "nice -n 10", ]
+    
+    ffmpeg += [ options.ffmpeg, "-y", "-threads", "4", "-i", fn, ]
+
+    if options.time:
+        ffmpeg.append("-t")
+        ffmpeg.append(options.time) 
+
+    if options.mode == "copy":
+        codecs = [ "-codec:v", "copy", "-codec:a", "copy", ]
+    elif options.mode == "sd":
+        codecs = [ "-codec:v:0", "libx264", "-b:v", "3500k", "-bt:v", "1500k",
+                   "-filter:v", "yadif", # == -deinterlace
+                   "-codec:a",] + aac_codec_name()
+        if options.stereo:
+            codecs += [ "-b:a", "128k", "-ac", "2", ]
+        else:
+            codecs += [ "-b:a", "512k", ]
+        metadata["hdvideo"] = "0"
+    elif options.mode == "hd":
+        codecs = [ "-codec:v:0", "libx264", "-b:v", "10000k", "-bt:v", "4000k",
+                   #"-filter:v", "yadif", # == -deinterlace
+                   "-codec:a",] + aac_codec_name() + \
+                   ["-b:a", "512k", ] # "-ac", "2", 
+        if options.stereo:
+            codecs += [ "-b:a", "128k", "-ac", "2", ]
+        else:
+            codecs += [ "-b:a", "512k", ]
+        metadata["hdvideo"] = "1"
+    elif options.mode == "recodehd":
+        codecs = [ "-codec:v:0", "libx264", "-b:v", "10000k", "-bt:v", "4000k",
+                   "-codec:a", "copy", ]
+        metadata["hdvideo"] = "1"
+    elif options.mode == "reaudio":
+        codecs = [ "-codec:v:0", "copy" , "-codec:a",] + aac_codec_name()
+        
+        if options.stereo:
+            codecs += [ "-b:a", "128k", "-ac", "2", ]
+        else:
+            codecs += [ "-b:a", "512k", ]
+                   
+        
+        
+    video = [ "-map", "0:v:0", ]
+
+    audio = []
+
+    for idx, spec in enumerate(options.soundtracks):
+        lang, no = soundtrack_option_re.match(spec).groups()
+
+        audio += [ "-metadata:s:a:%i" % int(idx),
+                   "language=%s" % lang,
+                   "-map", "0:%i,0:v:0" % (int(no)), ]
+         
+    output = [ outfn, ]
+
+    run(ffmpeg + codecs + video + audio + output)
+
+    
+def work(fn, metadata):
+    if options.mode == "metadata":
+        outfn = fn
+    else:
+        if fn == "-":
+            title = metadata.get("song", "TITLE")
+            date = metadata.get("date", "")
+            if not date:
+                year = metadata.get("year", "UNKNOWN")
+            else:
+                year = split(date, "-")[0]
+
+            outfn = os.path.join(options.outdir,
+                                 "%s (%s).m4v" % (title, year,))
+        else:
+            basename = os.path.basename(fn)
+            outfn = os.path.join(options.outdir, new_ext(basename, "m4v"))
+
+        run_ffmpeg(fn, outfn, metadata)
+        
+    if metadata: write_metadata(metadata, outfn)    
+    if options.art: write_art(outfn)
+
+    report("Done converting " + fn)
+
+def which(fn):
+    for path in os.environ["PATH"].split(":"):
+        if path == "": path = "."
+        if fn in os.listdir(path):
+            return os.path.join(path, fn)
+        
+    fn = os.path.abspath(fn)
+    if os.path.exists(fn):
+        return fn
+    
+    return None
+    
+class my_option_parser(optparse.OptionParser):
+    def format_description(self, formatter):
+        return self.description
+    
+def main():
+    global options
+    
+    usage = [ ]
+
+    usage.append("Meta info field names: (use with -m)")
+    for name, type, help in meta_tags:
+        usage.append("%15s %s %s" % ( ljust(name, 12), type, help, ))
+    usage.append("")
+    usage = join(usage, "\n")
+                     
+    
+    op = my_option_parser(usage="usage: %prog [options] [-h] <input file>",
+                          description=usage)
+    
+    gr = optparse.OptionGroup(op, "Modes")
+    gr.add_option("--hd", dest="mode", action="store_const", const="hd",
+                  help="Use codecs settings suitable for HD input.")
+    gr.add_option("--sd", dest="mode", action="store_const", const="sd",
+                  help="Use codecs settings suitable for SD input.")
+    gr.add_option("--copy", dest="mode", action="store_const", const="copy",
+                  help="Copy the input file's streams, don't reencode.")
+    gr.add_option("--metadata", dest="mode", action="store_const",
+                  const="metadata",
+                  help="Don't convert anything, just acquire metadata and "
+                  "write them to the input file.")
+    gr.add_option("--recodehd", dest="mode", action="store_const",
+                  const="recodehd",
+                  help="Recode HD video, copy the audio.")
+    gr.add_option("--reaudio", dest="mode", action="store_const",
+                  const="reaudio",
+                  help="Recode audio, copy the video stream.")
+    op.add_option_group(gr)
+    
+    gr = optparse.OptionGroup(op, "ffmpeg options")
+    gr.add_option("-t", dest="time", help="How many hh:mm:ss so convert")
+    gr.add_option("--ffmpeg", dest="ffmpeg", default="ffmpeg",
+                  help="Name of the ffmpeg executable")
+    gr.add_option("-f", dest="ffmpeg_options", default=[],
+                  help="Append/replace options to ffmpeg. Use "
+                       "-f <name>=<option> "
+                       "to append -<name> <option> to the command line. The "
+                       "script will attempt to place the option in the correct "
+                       "position.")
+    op.add_option_group(gr)
+    
+    gr = optparse.OptionGroup(op, "Sound options")
+    gr.add_option("-d", dest="deu_no", help="Number of German soundtrack",
+                  default=None)
+    gr.add_option("-e", dest="eng_no", help="Number of English soundtrack",
+                  default=None)
+    gr.add_option("--soundtrack", dest="soundtracks", action="append",
+                  help="Add soundtrack in arbitrary language as LANG=#, where"
+                  "LANG is the 3-letter language name and # the soundtracks"
+                  "number.", default=[])
+    gr.add_option("--stereo", dest="stereo", action="store_true",
+                  help="Convert to stereo audio.", default=False)
+    op.add_option_group(gr)
+    
+    gr = optparse.OptionGroup(op, "Subtitle options")
+    gr.add_option("-D", dest="deu_srt_fn", help="German subtitle (srt) file",
+                  default=None)
+    gr.add_option("-E", dest="eng_srt_fn", help="English subtitle (srt) file",
+                  default=None)
+    gr.add_option("--subtitle", dest="subtitles", action="append",
+                  help="Add subtitle track for arbitrary language LANG=<fn>, "
+                  "where LANG is the 3-letter language name and <fn> the"
+                  "name or an srt file.", default=[])
+    op.add_option_group(gr)
+    
+    gr = optparse.OptionGroup(op, "Metainfo options")
+    gr.add_option("-m", dest="metainfo", action="append", default=[],
+                  help="Use mp4tags to add metadata to the output file "
+                       "as <name>=<value>. For field names see above.")
+    gr.add_option("-a", dest="art", help="Cover art image to add",
+                  default=None)
+    gr.add_option("-n", dest="nfo_fn", default=None,
+                  help=".nfo file name (if different from vob)")
+    gr.add_option("--choose", dest="choose", default=None,
+                  help="When promting for a specific movie after metadata "
+                  "download, CHOOSE this index.")
+    op.add_option_group(gr)
+    
+    op.add_option("--debug", dest="debug", action="store_true",
+                  help="Don't run anything, just print out command lines")
+    op.add_option("--growl", dest="growl", action="store_true",
+                  default=which("growlnotify") is not None,
+                  help="Use growl notifyer to report completion or errors.")
+    op.add_option("-o", dest="outdir", help="Output directory",
+                  default=os.getenv("MOVIERIP_OUTDIR", "."))
+    op.add_option("-N", dest="nice", action="store_true",
+                  help="Be nice to other processes.")
+    
+
+    log.add_option(op)
+    # debug.add_option(op) -- Handled separately, because it would conflict -d.
+    
+    ( options, args, ) = op.parse_args()
+
+    if which(options.ffmpeg) is None:
+        op.error("Can't find %s on the path.")
+
+    if which("mp4tags") is None:
+        op.error("Can't find mp4tags on the path (download mp4v2 from "
+                 "http://code.google.com/p/mp4v2/")
+        
+    if which("mp4art") is None:
+        op.error("Can't find mp4art on the path (download mp4v2 from "
+                 "http://code.google.com/p/mp4v2/")
+    
+    if len(args) != 1:
+        op.error("Please specify an input file on the command line.")
+    else:
+        fn = args[0]
+
+    if not os.path.exists(fn):
+        op.error("Input file %s does not exist." % repr(fn))
+        
+    if options.mode is None:
+        if fn == "-":
+            name, ext = "", ""
+        else:
+            name, ext = rsplit(fn, ".", 1)
+            
+        ext = lower(ext)
+        if ext == "vob":
+            options.mode = "sd"
+        elif ext == "m2ts":
+            options.mode = "hd"
+        else:
+            op.error("Please specify a mode on the command line.")
+
+
+    if options.time:
+        time_re = re.compile("[0-8:]+")
+        if not time_re.match(options.time):
+            op.error("Please specify time as hh:mm:ss")
+            
+    try:
+        if options.deu_no is not None:
+            options.soundtracks.insert(0, "deu=%i" % int(options.deu_no))
+        if options.eng_no is not None:
+            options.soundtracks.insert(0, "eng=%i" % int(options.eng_no))
+    except:
+        op.error("German and English soundtrack numbers must be integer.")
+
+    if (options.deu_no and options.eng_no) and \
+            options.deu_no == options.eng_no:
+        op.error("German and English soundtrack can't have the same index.")
+
+    if len(options.soundtracks) == 0 and options.mode != "metadata":
+        op.error("No soundtrack has been chosen.")
+
+    for s in options.soundtracks:
+        match = soundtrack_option_re.match(s)
+        if match is None:
+            op.error("Please specify soundtracks as indicated by --help.")
+
+    metadata = set_once_dict()
+    for metainfo in options.metainfo:
+        name, value = split(metainfo, "=", 1)
+        metadata[name] = value
+
+    type = metadata.get("type", None)
+
+    if not type:
+        if os.path.basename(sys.argv[0]) == "tvshowrip":
+            metadata["type"] = type = "tvshow"
+        else:
+            metadata["type"] = type = "movie"
+
+    if options.nfo_fn is None:
+        if fn != "-":
+            nfo_fn = new_ext(fn, "nfo")
+        else:
+            nfo_fn = None
+    else:
+        nfo_fn = options.nfo_fn
+    
+    if metadata.has_key("show"):
+        # If the year has been passed in the show's name, separate
+        # the two.
+        show_and_year_re = re.compile(r"\s*(?P<show>.*?)\((?P<year>\d+)\)\s*")
+        match = show_and_year_re.match(metadata["show"])
+        if match is not None:
+            metadata.set("show", match.groupdict()["show"])
+            metadata.set("year", match.groupdict()["year"])
+        
+    if nfo_fn and os.path.exists(nfo_fn):
+        metadata.update(read_nfo(nfo_fn))
+    else:
+        if type == "movie":
+            song = metadata.get("song", None)
+            metadata.update(download_movie_metadata(fn, song))
+        elif type == "tvshow":
+            metadata.update(download_tvshow_metadata(fn, metadata))
+
+    # Print out the metadata, ordered by key.
+    items = metadata.items()
+    items.sort(lambda a, b: cmp(a[0], b[0]))
+    print >> log
+    for name, value in items:
+        print >> log, "%20s %s" % ( ljust(name, 20), str(value), )
+    print >> log
+            
+    # Copy the metadata from the command line again, so the user is
+    # always able to overwrite automatically generated infos.
+    #for metainfo in options.metainfo:
+    #    name, value = split(metainfo, "=", 1)
+    #    metadata[name] = value
+    # NOT NEEDED FOR set_once_dict.
+        
+    if options.debug: debug.verbose = True
+
+
+    if type == "movie":
+        required_fields = ("song", "year", "description", )
+    elif type == "tvshow":
+        required_fields = ("show", "song", "year",
+                           "season", "episode",
+                           "description", )        
+    else:
+        assert type in media_type_by_name.keys(), KeyError
+        required_fields = ()
+
+    for field in required_fields:
+        if not metadata.get(field, None):
+            op.error("Please specify -m %s=..." % field)
+
+    work(fn, metadata)
+    
+main()
