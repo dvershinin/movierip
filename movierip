@@ -25,6 +25,7 @@
 
 import sys, os, os.path, optparse, lxml.etree, re, subprocess, types, urllib
 from string import *
+from cStringIO import StringIO
 from t4.debug import log, debug
 
 options = None
@@ -32,6 +33,10 @@ options = None
 soundtrack_option_re = re.compile(r"([a-z]{3})=(\d+)")
 
 class set_once_dict(dict):
+    """
+    This is a subclass of dict that disregards new values for a key, if it
+    contains a value for that key already.
+    """
     def __setitem__(self, key, value):
         if self.has_key(key):
             return
@@ -56,7 +61,8 @@ def report(msg):
 
 def name_and_year(filename):
     """
-    Return a tuple a ( name, int(year), ). year may be None.
+    Attempt to parse a filename. Return a tuple a ( name, year, ).
+    The year may be None, otherwise it's an integer.
     """
     filename_re = re.compile(r"(.*?)\((\d+)\)\..*")
     match = filename_re.match(filename)
@@ -161,11 +167,13 @@ def download_movie_metadata(fn, title=None):
             
         options.art = artpath
 
-    genre = map(lambda d: d["name"], movie.get_genres())
-    genre = join(genre, ", ")
-        
     info = { "song": movie.movies["title"],
-             "description": description, "genre": genre}
+             "description": description, }
+    
+    genres = movie.get_genres()
+    if len(genres) > 0:
+        info["genre"] = genres[0]
+        
     if movie.movies["release_date"]:
         info["year"] = movie.movies["release_date"].split("-")[0]
 
@@ -353,7 +361,9 @@ def run(cmd):
     if type(cmd) == types.ListType:
         cmd = join(map(add_quotes_q, cmd), " ")
 
+    print
     print cmd
+    print
     
     if debug.verbose:
         print
@@ -378,8 +388,108 @@ def write_metadata(metadata, outfn):
 def write_art(outfn):
     run('mp4art --add "%s" "%s"' % ( options.art, outfn, ))
 
+
+def chapter_file_name(outfn):
+    name, ext = rsplit(outfn, ".", 1)
+    return "%s.chapters.txt" % name
+
+    
+def download_chapter_file(outfn, metadata):
+    p = subprocess.Popen(["ffmpeg", "-i", outfn,],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    stdout, stderr = p.communicate()
+
+    duration_re = re.compile(r"Duration: (\d+):(\d+):(\d+)\.(\d+),")
+    match = duration_re.search(stderr)
+    if match is None:
+        print >> sys.stderr, "WARNING: Can't determin duration.",\
+            "Not downloading chapter info"
+    else:
+        h, m, s, f = map(float, match.groups())
+        file_duration = h*3600 + m*60 + s # + f/100
+
+        if metadata:
+            title = metadata["song"]
+        else:
+            title, year = name_and_year(outfn)
+            title = strip(replace(title, "(HD)", ""))
+            
+        # Make a chapterdb query
+        query = { "title": title }
+        url = "http://chapterdb.org/Home/Grid?" + urllib.urlencode(query)
+        html = urllib.urlopen(url).read()
+
+        info_re = re.compile(r'<td><a href="/browse/(\d+)">(.*?)</a></td>\s+'
+                             r'<td.*?>(\d+):(\d+)\.(\d+)</td>', re.DOTALL)
+        result = info_re.findall(html)
+
+        def candidate_duration(id, title, h, m, s):
+            return float(h)*3600 + float(m)*60 + float(s)
+
+        def diff_candidate(id, title, h, m, s):
+            return abs(file_duration - candidate_duration(id, title, h, m, s))
+            
+        def is_candidate(id, title, h, m, s):            
+            return diff_candidate(id, title, h, m, s) <= 30
+
+        def cmp_candidates(a, b):
+            return cmp(diff_candidate(*a), diff_candidate(*b))
+            
+        candidates = filter(lambda tpl: is_candidate(*tpl), result)
+
+        if len(candidates) == 0:
+            print >> sys.stderr, "WARNING: Can't find suitable chapter entry."
+            return
+        elif len(candidates) == 1:
+            info = candidates[0]
+        elif len(candidates) > 1:
+            candidates.sort(cmp_candidates)
+            if diff_candidate(*candidates[0]) <= 2.0:
+                info = candidates[0]
+            else:
+                print
+                print "Found more than one suitable entry in chapterdb.org for"
+                print
+                print "'"+title+"'",
+                print "(%02i:%02i:%02i)" % (int(h), int(m), int(s)),
+                print "please choose:"
+                print
+                for counter, (id, title, h, m, s) in enumerate(candidates):
+                    print "%i:" % counter,
+                    print "(%02i:%02i:%02i)" % (int(h), int(m), int(s)),
+                    print title
+                print
+
+                print "Enter number or 'x' to cancel chapter writing [0]:",
+                answer = raw_input()
+                if answer == "":
+                    answer = "0"
+                elif answer == "x":
+                    return
+
+                answer = int(answer)
+                info = candidates[answer]
+
+        id = info[0]
+
+        chapters_txt_url = "http://chapterdb.org/Home/Download/%s?type=txt" % id
+        chapters_txt = urllib.urlopen(chapters_txt_url).read()
+        
+        open(chapter_file_name(outfn), "w").write(chapters_txt)
+    
+def write_chapters(outfn, metadata):
+    if not os.path.exists(chapter_file_name(outfn)):
+        download_chapter_file(outfn, metadata)
+        
+    if os.path.exists(chapter_file_name(outfn)):
+        # The download may fail!
+        run('mp4chaps -i "%s"' % ( outfn, ))
+        
+        
+    
+
 def aac_codec_name():
-    p = subprocess.Popen(["ffmpeg", "--codecs",], stdout=subprocess.PIPE)
+    p = subprocess.Popen(["ffmpeg", "-codecs",], stdout=subprocess.PIPE)
     stdout, stderr = p.communicate()
 
     if "libfaac" in stdout:
@@ -391,9 +501,9 @@ def run_ffmpeg(fn, outfn, metadata):
     ffmpeg = [ ]
 
     if options.nice:
-        ffmpeg += [ "nice -n 10", ]
+        ffmpeg += [ "nice", "-n", "10", ]
     
-    ffmpeg += [ options.ffmpeg, "-y", "-threads", "4", "-i", fn, ]
+    ffmpeg += [ options.ffmpeg, "-y", "-threads", options.threads, "-i", fn, ]
 
     if options.time:
         ffmpeg.append("-t")
@@ -473,6 +583,9 @@ def work(fn, metadata):
     if metadata: write_metadata(metadata, outfn)    
     if options.art: write_art(outfn)
 
+    if metadata["type"] == "movie":
+        write_chapters(outfn, metadata)
+
     report("Done converting " + fn)
 
 def which(fn):
@@ -523,6 +636,11 @@ def main():
     gr.add_option("--reaudio", dest="mode", action="store_const",
                   const="reaudio",
                   help="Recode audio, copy the video stream.")
+    gr.add_option("--chapters", dest="mode", action="store_const",
+                  const="chapters",
+                  help="Attempt to download a list of chapters from "
+                  "chapterdb.org and use mp4chaps to apply it to the output "
+                  "file.")
     op.add_option_group(gr)
     
     gr = optparse.OptionGroup(op, "ffmpeg options")
@@ -583,6 +701,8 @@ def main():
                   default=os.getenv("MOVIERIP_OUTDIR", "."))
     op.add_option("-N", dest="nice", action="store_true",
                   help="Be nice to other processes.")
+    op.add_option("-T", dest="threads", default="4",
+                  help="Run this many concurrent threads of ffmpeg (4).")
     
 
     log.add_option(op)
@@ -593,21 +713,24 @@ def main():
     if which(options.ffmpeg) is None:
         op.error("Can't find %s on the path.")
 
-    if which("mp4tags") is None:
-        op.error("Can't find mp4tags on the path (download mp4v2 from "
-                 "http://code.google.com/p/mp4v2/")
-        
-    if which("mp4art") is None:
-        op.error("Can't find mp4art on the path (download mp4v2 from "
-                 "http://code.google.com/p/mp4v2/")
-    
+    for a in ( "mp4tags", "mp4art", "mp4chaps", ):
+        if which(a) is None:
+            op.error("Can't find %s on the path (download mp4v2 from "
+                     "http://code.google.com/p/mp4v2/" % a)
+
     if len(args) != 1:
         op.error("Please specify an input file on the command line.")
     else:
         fn = args[0]
 
-    if not os.path.exists(fn):
+    if fn != "-" and not os.path.exists(fn):
         op.error("Input file %s does not exist." % repr(fn))
+
+
+    if options.mode == "chapters":
+        # Shortcut. If we're run in chapters mode, we don't download metadata.
+        write_chapters(fn, {})
+        return
         
     if options.mode is None:
         if fn == "-":
@@ -641,7 +764,7 @@ def main():
             options.deu_no == options.eng_no:
         op.error("German and English soundtrack can't have the same index.")
 
-    if len(options.soundtracks) == 0 and options.mode != "metadata":
+    if len(options.soundtracks) == 0 and options.mode == "metadata":
         op.error("No soundtrack has been chosen.")
 
     for s in options.soundtracks:
