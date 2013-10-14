@@ -60,8 +60,10 @@ def disembowl(vobfile):
     output = ffmpeg.stderr.read()
 
     info_re = re.compile(
-        r"Stream #(\d+:\d+)\[(0x[0-9a-f]+)\]: (:?Video|Audio)")
+        r"Stream #(\d+[:\.]\d+)\[(0x[0-9a-f]+)\]: (:?Video|Audio)")
     result = info_re.findall(output)
+
+    print result
     
     # Sort the input streams
     video_stream = None
