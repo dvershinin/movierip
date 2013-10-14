@@ -354,6 +354,7 @@ def read_nfo(nfo_fn):
             
 def add_quotes_q(s):
     s = replace(s, '"', "'")
+    
     if " " in s: return '"' + s + '"'
     else: return s
 
@@ -376,6 +377,9 @@ def run(cmd):
 def write_metadata(metadata, outfn):
     cmd = [ "mp4tags", ]
     for key, value in metadata.items():
+        if key == "genre" and type(value) == types.DictType:
+            value = value["name"]
+            
         if value:
             cmd.append("-" + key)
             cmd.append(value)
@@ -774,8 +778,12 @@ def main():
 
     metadata = set_once_dict()
     for metainfo in options.metainfo:
-        name, value = split(metainfo, "=", 1)
-        metadata[name] = value
+        try:
+            name, value = split(metainfo, "=", 1)
+        except ValueError:
+            op.error("The syntax for meta-info switches is: -m <name>=<value>")
+            
+        metadata[name] = strip(value)
 
     type = metadata.get("type", None)
 
