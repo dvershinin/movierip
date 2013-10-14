@@ -53,7 +53,7 @@ def main():
 def disembowl(vobfile):
     vobname = rsplit(op.basename(vobfile), ".", 1)[0]
 
-    cmd = ["ffprobe", vobfile, ]
+    cmd = ["ffmpeg", "-i", vobfile, ]
 
     ffmpeg = subprocess.Popen(cmd, stderr=subprocess.PIPE)
     ffmpeg.wait()
@@ -80,7 +80,7 @@ def disembowl(vobfile):
                "-map", stream,
                op.join(options.outdir, fn), ]
 
-        print >> log, cmd 
+        print >> log, join(cmd, " ")
 
         audio = subprocess.Popen(cmd,
                                  stdout=subprocess.PIPE,
