@@ -31,7 +31,10 @@ from t4.web.typography import improve_typography_unicode, normalize_whitespace
 
 options = None
 
-soundtrack_option_re = re.compile(r"([a-z]{3})=(\d+)")
+soundtrack_option_re = re.compile(r"([a-z]{3})=(\d+|only)")
+stream_re = re.compile(
+    r"Stream #(\d+):(\d+)(?:\(([a-z]+)\))?: (Audio|Video): (.*?)[, ]")
+
 
 py_str = str
 def str(s):
@@ -291,9 +294,8 @@ def download_tvshow_metadata(fn, metadata):
         # Copy the metadata derived from the filename to the return value.
         metadata.update(filename_metadata)
         
-        print >> sys.stderr, \
-            "Warning:Show '%(show)s' not found in thetvdb." % metadata
-        return metadata
+        raise Exception(
+            "Warning:Show '%(show)s' not found in thetvdb." % metadata)
 
     # Update the metadata. 
     metadata["show"] = str(show.data["seriesname"])
@@ -489,6 +491,14 @@ def ffmpeg_info(fn):
         
     return _ffmpeg_info[fn]
 
+def error_in_track_assignment(fn, msg):
+    if fn:
+        print >> sys.stderr, ffmpeg_info(fn)
+        print >> sys.stderr
+    print >> sys.stderr, msg
+    sys.exit(1)
+    
+
     
 def download_chapter_file(outfn, metadata):
     stderr = ffmpeg_info(outfn)
@@ -604,9 +614,6 @@ def analyze_mkv_file(fn, outfn, metadata):
     # Stream #0:2(jpn): Audio: dts (DTS), 48000 Hz, 5.0(side), fltp, 1536 kb/s
     # Metadata:
     #   title           : 3/2    
-    stream_re = re.compile(
-        r"Stream #(\d+):(\d+)\(([a-z]+)\): (Audio|Video): (.*?)[, ]")
-
     # Chapter #0.0: start 0.000000, end 435.184744
     #  Metadata:
     #    title           : Chapter 1
@@ -659,6 +666,22 @@ def aac_codec_name():
         return [ "aac", "-strict", "-2", ]
 
 def run_ffmpeg(fn, outfn, metadata):
+    # Get information on streams in the input file
+    stderr = ffmpeg_info(fn)
+
+    stream_type_by_no = {}
+    first_audio_stream_no = None
+    streams = stream_re.findall(stderr)
+    for infileno, trackno, lang, type_, format in streams:
+        trackno = int(trackno)
+        stream_type_by_no[trackno] = type_
+
+        if type_ == "Audio":
+            first_audio_stream_no = trackno
+
+    print stream_type_by_no, first_audio_stream_no
+
+    # Put together an ffmpeg command.
     ffmpeg = [ ]
 
     if options.nice:
@@ -673,7 +696,7 @@ def run_ffmpeg(fn, outfn, metadata):
     if options.mode == "copy":
         codecs = [ "-codec:v", "copy", "-codec:a", "copy", ]
     elif options.mode == "sd":
-        codecs = [ "-codec:v:0", "libx264", "-b:v", "3500k", "-bt:v", "1500k",
+        codecs = [ "-codec:v:0", "libx264", "-b", "1800k", "-bt:v", "1000k",
                    "-filter:v", "yadif", # == -deinterlace
                    "-codec:a",] + aac_codec_name()
         if options.stereo:
@@ -711,17 +734,35 @@ def run_ffmpeg(fn, outfn, metadata):
         if options.stereo:
             codecs += [ "-b:a", "256k", "-ac", "2", ]
         else:
-            codecs += [ "-b:a", "768k", ]
-                   
-        
-        
+            codecs += [ "-b:a", "512k", ]
+                                  
     video = [ "-map", "0:v:0", ]
+    
 
     audio = []
-
+    audio_tracks_picked = set()
     for idx, spec in enumerate(options.soundtracks):
         lang, no = soundtrack_option_re.match(spec).groups()
 
+        if no == "only":
+            if first_audio_stream_no is None:
+                raise Exception("%s does not contain audio tracks." % fn)
+            else:
+                no = first_audio_stream_no
+        else:
+            no = int(no)
+
+        # Check for validity
+        if stream_type_by_no[no] != "Audio":
+            msg = "Track %s trak %i for language %s is not an audio track." % (
+                fn, no, lang,)
+            error_in_track_assignment(fn, msg)
+
+        if no in audio_tracks_picked:
+            error_in_track_assignment(
+                fn, "Audio track %i chosen more than once." % no)
+            audio_tracks_picked.add(no)
+        
         audio += [ "-metadata:s:a:%i" % int(idx),
                    "language=%s" % lang,
                    "-map", "0:%i,0:v:0" % (int(no)), ]
@@ -947,13 +988,22 @@ def main():
         if not time_re.match(options.time):
             op.error("Please specify time as hh:mm:ss")
             
-    try:
-        if options.deu_no is not None:
-            options.soundtracks.insert(0, "deu=%i" % int(options.deu_no))
-        if options.eng_no is not None:
-            options.soundtracks.insert(0, "eng=%i" % int(options.eng_no))
-    except:
-        op.error("German and English soundtrack numbers must be integer.")
+    def lang_spec(lang, track):
+        if track == "only":
+            return "%s=only" % lang
+        else:
+            try:
+                track = int(track)
+            except ValueError:
+                op.error("German and English soundtrack numbers "
+                         "must be integer or 'only'.")
+                
+            return "%s=%i" % ( lang, int(track), )
+        
+    if options.deu_no is not None:
+        options.soundtracks.insert(0, lang_spec("deu", options.deu_no))
+    if options.eng_no is not None:
+        options.soundtracks.insert(0, lang_spec("eng", options.eng_no))
 
     if (options.deu_no and options.eng_no) and \
             options.deu_no == options.eng_no:
