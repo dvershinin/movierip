@@ -63,8 +63,6 @@ def disembowl(vobfile):
         r"Stream #(\d+[:\.]\d+)\[(0x[0-9a-f]+)\]: (:?Video|Audio)")
     result = info_re.findall(output)
 
-    print result
-    
     # Sort the input streams
     video_stream = None
     by_number = {}
