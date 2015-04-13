@@ -33,7 +33,7 @@ options = None
 
 soundtrack_option_re = re.compile(r"([a-z]{3})=(\d+|only)")
 stream_re = re.compile(
-    r"Stream #(\d+):(\d+)(?:\(([a-z]+)\))?: (Audio|Video): (.*?)[, ]")
+    r"Stream #(\d+):(\d+)(?:\(([a-z]+)\)|\[0x[a-f0-9]+\])?: (Audio|Video): (.*?)[, ]")
 
 
 py_str = str
@@ -102,39 +102,40 @@ def name_and_year(filename):
 
 def present_movie(idx, movie):
     print idx,
-    print "%(title)s (%(release_date)s)" % movie
+    print "%s (%i)" % ( movie.title, movie.releasedate.year, )
     
 def download_movie_metadata(fn, title=None):
     if title is None:
         title = fn
 
     try:
-        import tmdb
+        import tmdb3 as tmdb
     except ImportError:
         print >> sys.stderr, \
             ("Can't import tmdb Python module. Please install.\n"
-             "E.g by running 'easy_install tmdb' on the command line.\n"
+             "E.g by running 'easy_install tmdb3' on the command line.\n"
              "See http://www.themoviedb.org/documentation/api on how to\n"
              "obtain the required API key.")
         sys.exit(255)
         
-    tmdb.configure("a888a20b801aeefde1ba41a932898d48")
+    tmdb.set_key("a888a20b801aeefde1ba41a932898d48")
 
     name, year = name_and_year(title)
 
-    result = tmdb.Movies(name)
+    result = tmdb.searchMovie(name)
     
-    movies = list(result.iter_results())
+    movies = list(result)
 
     if year is not None:
         def year_match(movie):
             if movie is None:
                 return False
             else:
-                if not movie["release_date"]: return False
-                y, m, d = split(movie["release_date"], "-")
-                y = int(y)
-                return y == year or y == year - 1 or y == year + 1
+                if not movie.releasedate:
+                    return False
+                else:
+                    y = movie.releasedate.year
+                    return y == year or y == year - 1 or y == year + 1
         
         movies = filter(year_match, movies)
 
@@ -164,23 +165,23 @@ def download_movie_metadata(fn, title=None):
     else:
         idx = 0
 
-    movie = tmdb.Movie(movies[idx]["id"])
+    movie = movies[idx]
 
-    if movie.movies["tagline"] is None:
-        movie.movies["tagline"] = ""
+    if movie.tagline is None:
+        movie.tagline = ""
         
-    if movie.movies["overview"] is None:
-        movie.movies["overview"] = ""
+    if movie.overview is None:
+        movie.overview = ""
 
-    if strip(movie.movies["tagline"]):
-        description = movie.movies["tagline"] + \
-            u" — " + movie.movies["overview"]
+    if strip(movie.tagline):
+        description = movie.tagline + \
+            u" — " + movie.overview
     else:
-        description = movie.movies["overview"]
+        description = movie.overview
 
     # Download artwork
     if not options.art:
-        url = movie.get_poster()
+        url = movie.poster.geturl()
         rest, artfn = rsplit(url, "/", 1)
         artpath = os.path.join("/tmp", artfn)
 
@@ -192,15 +193,15 @@ def download_movie_metadata(fn, title=None):
             
         options.art = artpath
 
-    info = { "song": movie.movies["title"],
+    info = { "song": movie.title,
              "description": description, }
     
-    genres = movie.get_genres()
+    genres = movie.genres
     if len(genres) > 0:
-        info["genre"] = genres[0]
+        info["genre"] = genres[0].name
         
-    if movie.movies["release_date"]:
-        info["year"] = movie.movies["release_date"].split("-")[0]
+    if movie.releasedate:
+        info["year"] = str(movie.releasedate.year)
 
     return info
     
@@ -294,8 +295,7 @@ def download_tvshow_metadata(fn, metadata):
         # Copy the metadata derived from the filename to the return value.
         metadata.update(filename_metadata)
         
-        raise Exception(
-            "Warning:Show '%(show)s' not found in thetvdb." % metadata)
+        raise Exception("Show '%(show)s' not found in thetvdb." % metadata)
 
     # Update the metadata. 
     metadata["show"] = str(show.data["seriesname"])
@@ -307,6 +307,10 @@ def download_tvshow_metadata(fn, metadata):
     metadata["song"] = str(episode["episodename"])
     metadata["description"] = str(episode["overview"])
 
+    metadata["artist"] = str(episode.get("Director", "Unknown"))
+    metadata["episodeid"] = str(episode.get("ProductionCode", "S%02iE%02i" % (
+        season_no, episode_no)))
+    
     # We overwrite the year in the tv show metadata (which refers to the
     # show in thetvdb) with the date it first aired (which is much more
     # usefull in iTunes, I think).
@@ -336,7 +340,6 @@ def download_tvshow_metadata(fn, metadata):
 
     
     # Download artwork
-
     if not options.art:
         imgurl = None
         if season.has_key("filename") and season["filename"]:
@@ -437,13 +440,12 @@ def run(cmd):
         cmd = join(map(add_quotes_q, cmd), " ")
 
 
-    if log.verbose:
-        print
-        print cmd
-        print
+    print # >> log
+    print cmd
+    print 
     
     if debug.verbose:
-        print
+        print >> debug
     else:
         retval = os.system(str(cmd))
         if retval:
@@ -627,9 +629,9 @@ def analyze_mkv_file(fn, outfn, metadata):
 
     stderr = ffmpeg_info(fn)
 
+    reaudio = False
     streams = stream_re.findall(stderr)
-    if len(options.soundtracks) == 0:
-        reaudio = False
+    if len(options.soundtracks) == 0:        
         for infileno, trackno, lang, type, format in streams:
             if type == "Audio":
                 options.soundtracks.append("%s=%i" % ( lang, int(trackno), ))
@@ -654,7 +656,7 @@ def analyze_mkv_file(fn, outfn, metadata):
         options.mode = "reaudio"
     else:
         options.mode = "copy"
-            
+
 
 def aac_codec_name():
     p = subprocess.Popen(["ffmpeg", "-codecs",], stdout=subprocess.PIPE)
@@ -679,8 +681,6 @@ def run_ffmpeg(fn, outfn, metadata):
         if type_ == "Audio":
             first_audio_stream_no = trackno
 
-    print stream_type_by_no, first_audio_stream_no
-
     # Put together an ffmpeg command.
     ffmpeg = [ ]
 
@@ -693,18 +693,34 @@ def run_ffmpeg(fn, outfn, metadata):
         ffmpeg.append("-t")
         ffmpeg.append(options.time) 
 
+    for option in options.ffmpeg_options:
+        if "=" in option:
+            option, value = split(option, "=")
+            ffmpeg.append("-" + option)
+            ffmpeg.append(value)
+        else:
+            ffmpeg.append("-" + option)
+            
+        
     if options.mode == "copy":
         codecs = [ "-codec:v", "copy", "-codec:a", "copy", ]
+        options.twopass = False
     elif options.mode == "sd":
-        codecs = [ "-codec:v:0", "libx264", "-b", "1800k", "-bt:v", "1000k",
+        if options.twopass:
+            b = "1000k"
+            bt = "600k"
+        else:
+            b = "1800k"
+            bt = "1000k"
+        codecs = [ "-codec:v:0", "libx264", "-b", b, "-bt:v", bt,
                    "-filter:v", "yadif", # == -deinterlace
                    "-codec:a",] + aac_codec_name()
         if options.stereo:
             codecs += [ "-b:a", "128k", "-ac", "2", ]
         else:
-            codecs += [ "-b:a", "512k", ]
+            codecs += [ "-b:a", "512k", "-ac", "5", ]
         metadata["hdvideo"] = "0"
-    elif options.mode == "avi1500":
+    elif options.mode == "avi1500":            
         codecs = [ "-codec:v:0", "libx264",
                    "-b:v", "1500k",
                    # "-filter:v", "yadif", # == -deinterlace
@@ -715,14 +731,20 @@ def run_ffmpeg(fn, outfn, metadata):
         codecs += [ "-b:a", "128k", "-ac", "2", ]
         metadata["hdvideo"] = "0"
     elif options.mode == "hd":
-        codecs = [ "-codec:v:0", "libx264", "-b:v", "10000k", "-bt:v", "4000k",
-                   #"-filter:v", "yadif", # == -deinterlace
-                   "-codec:a",] + aac_codec_name() + \
-                   ["-b:a", "512k", ] # "-ac", "2", 
+        if options.twopass:
+            b = "6000k"
+            bt = "3000k"
+        else:
+            b = "10000k"
+            bt = "4000k"
+            
+        codecs = [ "-codec:v:0", "libx264", "-b:v", b, "-bt:v", bt,
+                       #"-filter:v", "yadif", # == -deinterlace
+                       "-codec:a",] + aac_codec_name()
         if options.stereo:
             codecs += [ "-b:a", "128k", "-ac", "2", ]
         else:
-            codecs += [ "-b:a", "512k", ]
+            codecs += [ "-b:a", "512k", "-ac", "5", ]
         metadata["hdvideo"] = "1"
     elif options.mode == "recodehd":
         codecs = [ "-codec:v:0", "libx264", "-b:v", "10000k", "-bt:v", "4000k",
@@ -734,7 +756,9 @@ def run_ffmpeg(fn, outfn, metadata):
         if options.stereo:
             codecs += [ "-b:a", "256k", "-ac", "2", ]
         else:
-            codecs += [ "-b:a", "512k", ]
+            codecs += [ "-b:a", "512k", "-ac", "5", ]
+            
+        options.twopass = False
                                   
     video = [ "-map", "0:v:0", ]
     
@@ -879,13 +903,13 @@ def main():
     gr.add_option("-t", dest="time", help="How many hh:mm:ss so convert")
     gr.add_option("--ffmpeg", dest="ffmpeg", default="ffmpeg",
                   help="Name of the ffmpeg executable")
-    gr.add_option("-f", dest="ffmpeg_options", default=[],
+    gr.add_option("-f", dest="ffmpeg_options", default=[], action="append",
                   help="Append/replace options to ffmpeg. Use "
                        "-f <name>=<option> "
                        "to append -<name> <option> to the command line. The "
                        "script will attempt to place the option in the correct "
                        "position.")
-    gr.add_option("-2", dest="twopass", action="store_true", default=False,
+    gr.add_option("-2", dest="twopass", action="store_true", default=True,
                   help="Make two x264 passes, that is: run ffmpeg twice.")
     op.add_option_group(gr)
     
@@ -945,7 +969,7 @@ def main():
     ( options, args, ) = op.parse_args()
 
     if which(options.ffmpeg) is None:
-        op.error("Can't find %s on the path.")
+        op.error("Can't find %s on the path." % options.ffmpeg)
 
     for a in ( "mp4tags", "mp4art", "mp4chaps", ):
         if which(a) is None:
