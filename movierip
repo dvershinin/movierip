@@ -86,6 +86,13 @@ def name_and_year(filename):
     Attempt to parse a filename. Return a tuple a ( name, year, ).
     The year may be None, otherwise it's an integer.
     """
+    filename_re = re.compile(r"(.*?)\.(\d+)\.\d+p\..*")
+    match = filename_re.match(filename)
+    if match is not None:
+        name, year = match.groups()
+        name = replace(name, ".", " ")
+        return ( name, int(year), )
+        
     filename_re = re.compile(r"(.*?)\((\d+)\)\..*")
     match = filename_re.match(filename)
     if match is not None:
@@ -102,7 +109,12 @@ def name_and_year(filename):
 
 def present_movie(idx, movie):
     print idx,
-    print "%s (%i)" % ( movie.title, movie.releasedate.year, )
+    if not movie.releasedate:
+        year = "unknown"
+    else:
+        year = str(movie.releasedate.year)
+        
+    print "%s (%s)" % ( movie.title, year, )
     
 def download_movie_metadata(fn, title=None):
     if title is None:
@@ -245,7 +257,9 @@ def download_tvshow_metadata(fn, metadata):
          r"(?:\s*-\s*)?"
          r"(?P<song>.*?)\."
          r"[\w]+"),        
-        ))
+        # Luther.1x03.HDTV.XviD-FoV.avi
+        (r"(?P<show>.*?)\."
+         r"\[?(?P<season>\d+)x(?P<episode>\d+)\]?\.?")))
 
     # Combine the metadata. The metadata provided by the user manually
     # takes precidence.
@@ -707,11 +721,12 @@ def run_ffmpeg(fn, outfn, metadata):
         options.twopass = False
     elif options.mode == "sd":
         if options.twopass:
-            b = "1000k"
+            b = "1300k"
             bt = "600k"
         else:
             b = "1800k"
             bt = "1000k"
+            
         codecs = [ "-codec:v:0", "libx264", "-b", b, "-bt:v", bt,
                    "-filter:v", "yadif", # == -deinterlace
                    "-codec:a",] + aac_codec_name()
@@ -754,7 +769,7 @@ def run_ffmpeg(fn, outfn, metadata):
         codecs = [ "-codec:v:0", "copy" , "-codec:a",] + aac_codec_name()
         
         if options.stereo:
-            codecs += [ "-b:a", "256k", "-ac", "2", ]
+            codecs += [ "-b:a", "128k", "-ac", "2", ]
         else:
             codecs += [ "-b:a", "512k", "-ac", "5", ]
             
@@ -834,8 +849,11 @@ def work(fn, metadata):
 def which(fn):
     for path in os.environ["PATH"].split(":"):
         if path == "": path = "."
-        if fn in os.listdir(path):
-            return os.path.join(path, fn)
+        try:
+            if fn in os.listdir(path):
+                return os.path.join(path, fn)
+        except OSError:
+            pass
         
     fn = os.path.abspath(fn)
     if os.path.exists(fn):
