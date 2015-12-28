@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8; mode: python; -*-
 
-##  Copyright 2010-13 by Diedrich Vorberg <diedrich@tux4web.de>
+##  Copyright 2010–15 by Diedrich Vorberg <diedrich@tux4web.de>
 ##
 ##  All Rights Reserved
 ##
@@ -102,7 +102,12 @@ def name_and_year(filename):
 
 def present_movie(idx, movie):
     print idx,
-    print "%s (%i)" % ( movie.title, movie.releasedate.year, )
+    if type(movie.releasedate) == types.UnicodeType:
+        year = movie.releasedate
+    else:
+        year = str(movie.releasedate.year)
+        
+    print "%s (%s)" % ( movie.title, year, )
     
 def download_movie_metadata(fn, title=None):
     if title is None:
@@ -144,7 +149,9 @@ def download_movie_metadata(fn, title=None):
         sys.exit(1)
     elif len(movies) > 1:
         
-        print
+        movies.sort(lambda a, b: cmp(str(a.releasedate), str(b.releasedate)))
+        
+        print        
         for idx, movie in enumerate(movies):
             present_movie(idx, movie)
         print
@@ -245,7 +252,9 @@ def download_tvshow_metadata(fn, metadata):
          r"(?:\s*-\s*)?"
          r"(?P<song>.*?)\."
          r"[\w]+"),        
-        ))
+        # Luther.1x03.HDTV.XviD-FoV.avi
+        (r"(?P<show>.*?)\."
+         r"\[?(?P<season>\d+)x(?P<episode>\d+)\]?\.?")))
 
     # Combine the metadata. The metadata provided by the user manually
     # takes precidence.
@@ -707,11 +716,12 @@ def run_ffmpeg(fn, outfn, metadata):
         options.twopass = False
     elif options.mode == "sd":
         if options.twopass:
-            b = "1000k"
+            b = "1300k"
             bt = "600k"
         else:
             b = "1800k"
             bt = "1000k"
+            
         codecs = [ "-codec:v:0", "libx264", "-b", b, "-bt:v", bt,
                    "-filter:v", "yadif", # == -deinterlace
                    "-codec:a",] + aac_codec_name()
@@ -754,7 +764,7 @@ def run_ffmpeg(fn, outfn, metadata):
         codecs = [ "-codec:v:0", "copy" , "-codec:a",] + aac_codec_name()
         
         if options.stereo:
-            codecs += [ "-b:a", "256k", "-ac", "2", ]
+            codecs += [ "-b:a", "128k", "-ac", "2", ]
         else:
             codecs += [ "-b:a", "512k", "-ac", "5", ]
             
