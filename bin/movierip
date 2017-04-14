@@ -839,6 +839,9 @@ def main():
     gr.add_option("--choose", dest="choose", default=None,
                   help="When promting for a specific movie after metadata "
                   "download, CHOOSE this index.")
+    gr.add_option("--german", dest="german", default=False,
+                  action="store_true",
+                  help="Download German metainfo, if available.")
     op.add_option_group(gr)
     
     op.add_option("--debug", dest="debug", action="store_true",
@@ -859,6 +862,9 @@ def main():
     
     ( options, args, ) = op.parse_args()
     movierip.options = options
+
+    if op.german:
+        movierip.tmdb.set_locale("de")
     
     if which(options.ffmpeg) is None:
         op.error("Can't find %s on the path." % options.ffmpeg)
