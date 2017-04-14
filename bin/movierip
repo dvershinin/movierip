@@ -839,8 +839,8 @@ def main():
     gr.add_option("--choose", dest="choose", default=None,
                   help="When promting for a specific movie after metadata "
                   "download, CHOOSE this index.")
-    gr.add_option("--german", dest="german", default=False,
-                  action="store_true",
+    gr.add_option("--german", dest="german", 
+                  action="store_true", default=False,
                   help="Download German metainfo, if available.")
     op.add_option_group(gr)
     
@@ -863,7 +863,7 @@ def main():
     ( options, args, ) = op.parse_args()
     movierip.options = options
 
-    if op.german:
+    if options.german:
         movierip.tmdb.set_locale("de")
     
     if which(options.ffmpeg) is None:
