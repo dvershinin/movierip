@@ -43,17 +43,25 @@ def with_white_background(poster):
     return white
     
 
-def create_cover_image(poster):
+def create_cover_image(poster, disktype):
     """
     Poster is a PIL.Image that’s composed into BDCoverTemplate.png
     """
-    box = ((0,142), (960,1448),)
+    if disktype == "bd":
+        box = ((0,142), (960,1448),)
+        template_filename = "BDCoverTemplate.png"
+    elif disktype == "dvd":
+        box = ((0,14), (988,1384),)
+        template_filename = "DVDCoverTemplate.png"
+    else:
+        raise ValueError(disktype)
+        
     (ax, ay), (bx, by) = box
     w = bx-ax; h = by-ay
 
     # Load the template
     template_path = op.join(op.dirname(movierip.__file__),
-                            "__resources", "BDCoverTemplate.png")
+                            "__resources", template_filename)
     template = Image.open(template_path)
 
     posterw, posterh = poster.size
@@ -86,11 +94,18 @@ def create_cover_image(poster):
     return ret
 
 
-def create_dummy_frame(cover):
+def create_dummy_frame(cover, disktype):
     cover = cover.resize( (574, 860) )
-    
-    template_path = op.join(op.dirname(movierip.__file__),
-                            "__resources", "BDDummyFrame.png")
+
+    if disktype == "bd":
+        template_path = op.join(op.dirname(movierip.__file__),
+                                "__resources", "BDDummyFrame.png")
+    elif disktype == "dvd":
+        template_path = op.join(op.dirname(movierip.__file__),
+                                "__resources", "DVDDummyFrame.png")
+    else:
+        raise ValueError(disktype)
+        
     template = Image.open(template_path)
     template = template.convert("RGBA")    
     template.paste(cover, (192, 108), cover)
@@ -107,6 +122,8 @@ def main():
     ap.add_argument("-g", dest="german",
                     action="store_true", default=False,
                     help="Use German poster and blurm from tmdb, if available.")
+    ap.add_argument("-t", dest="disktype", choices=["bd", "dvd"], default="bd",
+                    help="Choose BD (BluRay Disk) (default) or DVD.")
     debug.add_argument(ap)
     
     args = ap.parse_args()
@@ -134,8 +151,8 @@ def main():
     else:
         raise Exception("No artwork for the poster provided.")
 
-    cover = create_cover_image(poster)
-    dummy_frame = create_dummy_frame(cover)
+    cover = create_cover_image(poster, args.disktype)
+    dummy_frame = create_dummy_frame(cover, args.disktype)
 
     sl = slug()
     cover_png_path = op.join(tempfile.gettempdir(), "cover_%s.jpg" % sl)
