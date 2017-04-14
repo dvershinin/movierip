@@ -160,8 +160,14 @@ def main():
     print >> fp, "CHAPTER01=00:00:00.000"
     print >> fp, "CHAPTER01NAME=Main Titles"
     fp.close()
+
+    if args.german:
+        gr = "--german"
+    else:
+        gr = ""
         
-    cmd = "movierip --metadata -a %s %s" % ( cover_png_path, dummy_movie_path,)
+    cmd = "movierip --metadata -a %s %s %s" % (
+        cover_png_path, gr, dummy_movie_path,)
     debug("Running movierip to download the metadata:", cmd)
     run(cmd)
 
