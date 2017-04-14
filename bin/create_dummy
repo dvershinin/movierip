@@ -1,0 +1,193 @@
+#!/usr/bin/env python
+# -*- coding: utf-8; mode: python; -*-
+
+##  Copyright 2017 by Diedrich Vorberg <diedrich@tux4web.de>
+##
+##  All Rights Reserved
+##
+##  For more Information on orm see the README file.
+##
+##  This program is free software; you can redistribute it and/or modify
+##  it under the terms of the GNU General Public License as published by
+##  the Free Software Foundation; either version 3 of the License, or
+##  (at your option) any later version.
+##
+##  This program is distributed in the hope that it will be useful,
+##  but WITHOUT ANY WARRANTY; without even the implied warranty of
+##  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+##  GNU General Public License for more details.
+##
+##  You should have received a copy of the GNU General Public License
+##  along with this program; if not, write to the Free Software
+##  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+##
+##  I have added a copy of the GPL in the file LICENSE
+
+"""
+Download a movie’s poster from TheMovieDb and create a dummy .m4v with all the
+metadata in it, that has a DVD cover. This goes into my iTunes library, so I
+don’t forget, which movies I’ve got on physical media.
+"""
+
+import sys, os, os.path as op, re, argparse, urllib, tempfile
+import movierip
+from PIL import Image
+from cStringIO import StringIO
+
+from t4.utils import thumb_size, slug, run
+from t4.debug import log as debug
+
+def with_white_background(poster):
+    white = Image.new("RGBA", poster.size, "white")
+    white.paste(poster, (0,0), poster)
+    return white
+    
+
+def create_cover_image(poster):
+    """
+    Poster is a PIL.Image that’s composed into BDCoverTemplate.png
+    """
+    box = ((0,142), (960,1448),)
+    (ax, ay), (bx, by) = box
+    w = bx-ax; h = by-ay
+
+    # Load the template
+    template_path = op.join(op.dirname(movierip.__file__),
+                            "__resources", "BDCoverTemplate.png")
+    template = Image.open(template_path)
+
+    posterw, posterh = poster.size
+    
+    # Create a temporary copy of the poster that will fill the poster-area
+    # of the template.
+    if w > h: # landscape
+        tmph = h
+        tmpw = int(posterw * (float(w) / float(posterw)))
+    else:
+        tmpw = w
+        tmph = int(posterh * (float(h) / float(posterh)))
+
+    tmpsize = tmpw, tmph,
+    
+    scaled_poster = poster.resize(tmpsize, Image.ANTIALIAS)
+
+    # Now crop the poster to the actual target size.
+    if tmpw < w or tmph < h:
+        offx = tmpw-w; offy = tmph-h
+    else:
+        offx = 0; offy = 0
+
+    cropped_poster = scaled_poster.crop( (offx, offy, w+offx, h+offy) )
+
+    # Now paste this into the template
+    ret = Image.new("RGBA", template.size)
+    ret.paste(cropped_poster, box[0])
+    ret.paste(template, (0,0), template)
+    return ret
+
+
+def create_dummy_frame(cover):
+    cover = cover.resize( (574, 860) )
+    
+    template_path = op.join(op.dirname(movierip.__file__),
+                            "__resources", "BDDummyFrame.png")
+    template = Image.open(template_path)
+    template = template.convert("RGBA")    
+    template.paste(cover, (192, 108), cover)
+    return template
+    
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("title", type=str, nargs=1,
+                    help="Movie title (with year in parenthesese) or tmdb id")
+    ap.add_argument("-a", dest="artwork",
+                    metavar="filename", type=str, default=None,
+                    help="Filepath to a poster as .jpg file")
+    ap.add_argument("-g", dest="german",
+                    action="store_true", default=False,
+                    help="Use German poster and blurm from tmdb, if available.")
+    debug.add_argument(ap)
+    
+    args = ap.parse_args()
+    debug.verbose = args.log
+
+    movie_title = args.title[0]
+
+    os.chdir(op.join(os.getenv("HOME"), "Desktop"))
+    
+    debug("Getting movie info from tmdb for “%s”" % movie_title)
+    if args.german:
+        movierip.tmdb.set_locale("de")
+    movie = movierip.get_tmdb_movie_for(movie_title)    
+    debug("Found", repr(movie))
+    
+    poster = None
+
+    if args.artwork:
+        poster = Image.open(args.artwork)
+    elif movie.poster:
+        url = movie.poster.geturl("original")
+        poster_jpeg = urllib.urlopen(url).read()
+
+        poster = Image.open(StringIO(poster_jpeg))
+    else:
+        raise Exception("No artwork for the poster provided.")
+
+    cover = create_cover_image(poster)
+    dummy_frame = create_dummy_frame(cover)
+
+    sl = slug()
+    cover_png_path = op.join(tempfile.gettempdir(), "cover_%s.jpg" % sl)
+    #cover_on_white = with_white_background(cover)    
+    cover.save(cover_png_path, "PNG")
+    debug("Wrote cover PNG to", cover_png_path)
+    
+    dummy_frame_path = op.join(tempfile.gettempdir(), "dummy_frame_%s.png" % sl)
+    dummy_frame.save(dummy_frame_path, "PNG")
+    debug("Wrote dummy frame to", dummy_frame_path)
+
+    dummy_movie_path = op.join(os.getenv("HOME"), "Desktop",
+                               "%s.m4v" % movie.id)
+    
+    debug("Starting ffmpeg to create", dummy_movie_path)
+    cmd = "ffmpeg -loop 1 -i %s -c:v libx264 -t 15 -pix_fmt yuv420p %s" % (
+        dummy_frame_path, dummy_movie_path)
+    debug(cmd)
+    run(cmd)    
+
+    fp = open("%i.chapters.txt" % movie.id, "w")
+    print >> fp, "CHAPTER01=00:00:00.000"
+    print >> fp, "CHAPTER01NAME=Main Titles"
+    fp.close()
+
+    if args.german:
+        gr = "--german"
+    else:
+        gr = ""
+        
+    cmd = "movierip --metadata -a %s %s %s" % (
+        cover_png_path, gr, dummy_movie_path,)
+    debug("Running movierip to download the metadata:", cmd)
+    run(cmd)
+
+    os.unlink(cover_png_path)
+    os.unlink(dummy_frame_path)
+    
+    if op.exists("%i.chapters.txt" % movie.id):
+        os.unlink("%i.chapters.txt" % movie.id)
+
+    if movie.releasedate:
+        fn = u"%s (%s).m4v" % ( movie.title, movie.releasedate.year, )
+    else:
+        fn = movie.title
+    fn = fn.encode("utf-8")
+    
+    os.rename(dummy_movie_path, fn)
+    
+if __name__ == "__main__":
+    main()
+
+
+
+

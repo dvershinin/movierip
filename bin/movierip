@@ -1,0 +1,1023 @@
+#!/usr/bin/env python
+# -*- coding: utf-8; mode: python; -*-
+
+##  Copyright 2010–15 by Diedrich Vorberg <diedrich@tux4web.de>
+##
+##  All Rights Reserved
+##
+##  For more Information on orm see the README file.
+##
+##  This program is free software; you can redistribute it and/or modify
+##  it under the terms of the GNU General Public License as published by
+##  the Free Software Foundation; either version 3 of the License, or
+##  (at your option) any later version.
+##
+##  This program is distributed in the hope that it will be useful,
+##  but WITHOUT ANY WARRANTY; without even the implied warranty of
+##  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+##  GNU General Public License for more details.
+##
+##  You should have received a copy of the GNU General Public License
+##  along with this program; if not, write to the Free Software
+##  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+##
+##  I have added a copy of the GPL in the file LICENSE
+
+import sys, os, os.path, optparse, lxml.etree, re, subprocess, types, urllib
+from string import *
+from cStringIO import StringIO
+from t4.debug import log, debug
+from t4.web.typography import improve_typography_unicode, normalize_whitespace
+
+import movierip
+
+options = None
+
+soundtrack_option_re = re.compile(r"([a-z]{3})=(\d+|only)")
+stream_re = re.compile(
+    r"Stream #(\d+):(\d+)(?:\(([a-z]+)\)|\[0x[a-f0-9]+\])?: (Audio|Video): (.*?)[, ]")
+
+
+py_str = str
+def str(s):
+    if type(s) == types.UnicodeType:
+        return s.encode("utf-8")
+    else:
+        return py_str(s)
+
+py_unicode = unicode
+def unicode(s):
+    if type(s) == types.UnicodeType:
+        return s
+    else:
+        return py_unicode(s, "utf-8")
+
+    
+def improve_typography(s):
+    return improve_typography_unicode(unicode(s), "en")
+    
+class set_once_dict(dict):
+    """
+    This is a subclass of dict that disregards new values for a key, if it
+    contains a value for that key already.
+    """
+    def __setitem__(self, key, value):
+        if self.has_key(key):
+            return
+        else:
+            self.set(key, value)
+
+    def update(self, other):
+        for key, value in other.iteritems():
+            self[key] = value
+
+    def set(self, key, value):
+        """
+        Set a value, overwriting if present.
+        """
+        dict.__setitem__(self, key, value)
+
+def report(msg):
+    if options.growl:
+        os.system("growlnotify -s -m %s" % add_quotes_q(msg))
+    else:
+        print >> log, msg
+
+
+def download_movie_metadata(fn, title=None):
+    if title is None:
+        title, ext = os.path.splitext(os.path.basename(fn))
+        
+    return movierip.info_from_tmdb_movie(movierip.get_tmdb_movie_for(title))
+    
+def download_tvshow_metadata(fn, metadata):
+    try:
+        import tvdb_api
+        from tvdb_exceptions import tvdb_shownotfound
+    except ImportError:
+        print >> sys.stderr, \
+            ("Can't import tvdb_api Python module. Please install.\n"
+             "E.g by running 'easy_install tvdb_api' on the command line.\n"
+             "See http://thetvdb.com/wiki/index.php?title=Programmers_API\n"
+             "on how to obtain the required API key.")
+        sys.exit(255)
+
+
+    tvshow_filename_regexs = map(lambda s: re.compile(s, re.IGNORECASE), (
+        # The Simpsons (1989).S01E10.Simpsons Roasting on an Open Fire.vob
+        (r"(?P<show>.*?)\((?P<year>\d+)\)\."
+         r"S(?P<season>\d+)E(?P<episode>\d+)\."
+         r"(?P<song>.*?)\."
+         r"[\w]+"),
+        # The Simpsons.S01E10.Simpsons Roasting on an Open Fire.vob
+        (r"(?P<show>.*?)\."
+         r"S(?P<season>\d+)E(?P<episode>\d+)\."
+         r"(?P<song>.*?)\."
+         r"[\w]+"),
+        # S01E10.The Simpsons Roasting on an Open Fire.vob
+        (r"S(?P<season>\d+)E(?P<episode>\d+)\."
+         r"(?P<song>.*?)\."
+         r"[\w]+"),
+        # S01E10
+        r"S(?P<season>\d+)E(?P<episode>\d+)",
+        # The Simpsons [18x01] The Mook, the Chef, the Wife, and Her Homer.avi
+        (r"(?P<show>.*?)\s+"
+         r"\[?(?P<season>\d+)x(?P<episode>\d+)\]?\s+"
+         r"(?P<song>.*?)\."
+         r"[\w]+"),
+        # 21x01 - Homer the Whopper.avi
+        (r"\[?(?P<season>\d+)x(?P<episode>\d+)\]?\s+"
+         r"(?:\s*-\s*)?"
+         r"(?P<song>.*?)\."
+         r"[\w]+"),        
+        # Luther.1x03.HDTV.XviD-FoV.avi
+        (r"(?P<show>.*?)\."
+         r"\[?(?P<season>\d+)x(?P<episode>\d+)\]?\.?")))
+
+    # Combine the metadata. The metadata provided by the user manually
+    # takes precidence.
+    filename_metadata = {}
+    for regex in tvshow_filename_regexs:
+        result = regex.search(fn)
+        if result is not None:
+            filename_metadata = result.groupdict()
+            break
+    filename_metadata.update(metadata)
+
+    # Combine the filename metadata and the metadata provided by the user.
+    # User-provided info takes precidence.
+    combined_metadata = {}
+    combined_metadata.update(filename_metadata)
+    combined_metadata.update(metadata)
+    
+    # If the metadata doesn't contain season and episode numbers, we can't
+    # download anything.
+    try:
+        show_name = combined_metadata["show"]
+        season_no = int(combined_metadata["season"])
+        episode_no = int(combined_metadata["episode"])
+    except (KeyError, ValueError,):
+        print >> log, ("Need show name, season and episode number to "
+                       "download metadata.")
+        return {}
+    
+    tvdb = tvdb_api.Tvdb(interactive = False,
+                         select_first = False,
+                         debug = False,
+                         cache = True,
+                         banners = False,
+                         actors = False,
+                         custom_ui = None,
+                         language = None, # get from os.environ?
+                         search_all_languages = False,
+                         apikey = "38D14E6C027D622A",
+                         forceConnect=False,
+                         useZip=False)
+
+    try:
+        # I'm surprised the mapping semantic is the only public interface
+        # of the Tvdb class. 
+        show = tvdb[metadata["show"]]
+    except tvdb_shownotfound:
+        # Copy the metadata derived from the filename to the return value.
+        metadata.update(filename_metadata)
+        
+        raise Exception("Show '%(show)s' not found in thetvdb." % metadata)
+
+    # Update the metadata. 
+    metadata["show"] = str(show.data["seriesname"])
+    metadata["network"] = str(show.data["network"])
+    
+    season = show[season_no]
+    episode = season[episode_no]
+
+    metadata["song"] = str(episode["episodename"])
+    metadata["description"] = str(episode["overview"])
+
+    metadata["artist"] = str(episode.get("Director", "Unknown"))
+    metadata["episodeid"] = str(episode.get("ProductionCode", "S%02iE%02i" % (
+        season_no, episode_no)))
+    
+    # We overwrite the year in the tv show metadata (which refers to the
+    # show in thetvdb) with the date it first aired (which is much more
+    # usefull in iTunes, I think).
+    metadata.set("year", str(episode["firstaired"].split("-")[0]))
+        
+
+    # Copy the metadata derived from the filename to the return value.
+    metadata.update(filename_metadata)
+    
+    # lines = []
+    
+    # keys = show.data.keys()
+    # keys.sort()
+    # for key in keys:
+    #     lines.append("%s: %s" % ( key, show.data[key], ))
+
+    # lines.append("")
+        
+    # keys = episode.keys()
+    # keys.sort()
+    # for key in keys:
+    #     lines.append("%s: %s" % ( key, episode[key], ))
+
+    # lines.append("")
+    
+    # metadata["comment"] = join(lines, "\n")
+
+    
+    # Download artwork
+    if not options.art:
+        imgurl = None
+        if season.has_key("filename") and season["filename"]:
+            imgurl = season["filename"]
+        else:            
+            url = "http://thetvdb.com/?tab=season&seriesid=%s&seasonid=%s" % (
+                episode["seriesid"], episode["seasonid"], )
+            source = urllib.urlopen(url).read()
+            
+            banner_tag_re = re.compile(r'<a href="(banners/seasons/[^"]+)" '
+                                       r'target="_blank">View Full Size</a>')
+            result = banner_tag_re.findall(source)
+
+            if len(result) > 0:
+                imgurl = "http://thetvdb.com/" + result[0]
+
+        if imgurl is not None:            
+            rest, artfn = rsplit(imgurl, "/", 1)
+            artpath = os.path.join("/tmp", artfn)
+                            
+            if not os.path.exists(artpath):
+                print >> debug, "Downloading", imgurl, "=>", artpath
+                jpeg = urllib.urlopen(imgurl).read()        
+                fp = open(artpath, "w")
+                fp.write(jpeg)
+                fp.close()
+            else:
+                print >> debug, "Using", artpath
+            
+            options.art = artpath
+
+    
+    return metadata
+    
+    
+def new_ext(fn, newext):
+    if "." in fn:
+        name, ext = rsplit(fn, ".", 1)
+    else:
+        name = fn
+    return name + "." + newext
+
+
+mp4tags_field_re = re.compile("^\s+-[A-Za-z],\s+-([a-z]+)\s+([A-Z]+)\s+(.*)$",
+                              re.MULTILINE)
+def ask_mp4tags_for_tags():
+    p = subprocess.Popen(["mp4tags", "--help",], stderr=subprocess.PIPE)
+    stdout, stderr = p.communicate()
+
+    return mp4tags_field_re.findall(stderr)
+
+# meta_tags -> [ ( name, type, help, ), ... ]
+meta_tags = ask_mp4tags_for_tags()
+meta_tag_names = map(lambda tpl: tpl[0], meta_tags)
+
+nfo_fields_to_tags = {  "title": "song",
+                        "season": "season",
+                        "episode": "episode",
+                        "plot": "description",
+                        "director": "artist",
+                        "aired": "year", }
+
+media_type_by_name = { "music": 1,
+                       "audiobook": 2,
+                       "musicvideo": 6,
+                       "movie": 9,
+                       "tvshow": 10,
+                       "booklet": 11,
+                       "ringtone": 14, }
+
+media_type_by_stik = dict(map(lambda tpl: (tpl[1], tpl[0],),
+                              media_type_by_name.items()))
+
+
+def read_nfo(nfo_fn):
+    """
+    Read the nfo file and return mp4tags-compatible field names.
+    """
+    dom = lxml.etree.parse(open(nfo_fn))
+    def get(tag):
+        try:
+            return dom.xpath("string(/episodedetails/%s)" % tag)
+        except Exception, e:
+            return None
+    
+    return dict(map(lambda field: ( nfo_fields_to_tags[field], get(field), ),
+                    nfo_fields_to_tags.keys()))
+    
+            
+def add_quotes_q(s):
+    s = replace(s, '"', "'")
+    
+    if " " in s: return '"' + s + '"'
+    else: return s
+
+def run(cmd):
+    if type(cmd) == types.ListType:
+        cmd = join(map(add_quotes_q, cmd), " ")
+
+
+    print # >> log
+    print cmd
+    print 
+    
+    if debug.verbose:
+        print >> debug
+    else:
+        retval = os.system(str(cmd))
+        if retval:
+            report("Command execution failed: " + cmd)
+            sys.exit(retval)
+
+def write_metadata(metadata, outfn):
+    cmd = [ "mp4tags", ]
+
+    for field in ("song", "description",):
+        if metadata.has_key(field):
+            metadata[field] = improve_typography(field)
+    
+    for key, value in metadata.items():
+        if key == "genre" and type(value) == types.DictType:
+            value = value["name"]
+
+        value = normalize_whitespace(value)
+            
+        if value:
+            cmd.append("-" + key)
+            cmd.append(value)
+
+    cmd.append(outfn)
+
+    run(cmd)
+    
+        
+def write_art(outfn):
+    run('mp4art --overwrite --add "%s" "%s"' % ( options.art, outfn, ))
+
+
+def chapter_file_name(outfn):
+    name, ext = rsplit(outfn, ".", 1)
+    return "%s.chapters.txt" % name
+
+
+_ffmpeg_info = {}
+def ffmpeg_info(fn):
+    if not _ffmpeg_info.has_key(fn):
+        p = subprocess.Popen(["ffmpeg", "-i", fn,],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        stdout, stderr = p.communicate()
+        _ffmpeg_info[fn] = stderr
+        
+    return _ffmpeg_info[fn]
+
+def error_in_track_assignment(fn, msg):
+    if fn:
+        print >> sys.stderr, ffmpeg_info(fn)
+        print >> sys.stderr
+    print >> sys.stderr, msg
+    sys.exit(1)
+    
+
+    
+def download_chapter_file(outfn, metadata):
+    stderr = ffmpeg_info(outfn)
+
+    duration_re = re.compile(r"Duration: (\d+):(\d+):(\d+)\.(\d+),")
+    match = duration_re.search(stderr)
+    if match is None:
+        print >> sys.stderr, "WARNING: Can't determin duration.",\
+            "Not downloading chapter info"
+    else:
+        h, m, s, f = map(float, match.groups())
+        file_duration = h*3600 + m*60 + s # + f/100
+
+        if metadata:
+            title = metadata["song"]
+        else:
+            title, year = movierip.name_and_year(outfn)
+            title = strip(replace(title, "(HD)", ""))
+            
+        # Make a chapterdb query
+        query = { "title": title }
+        url = "http://chapterdb.org/Home/Grid?" + urllib.urlencode(query)
+        html = urllib.urlopen(url).read()
+
+        info_re = re.compile(r'<td><a href="/browse/(\d+)">(.*?)</a></td>\s+'
+                             r'<td.*?>(\d+):(\d+)\.(\d+)</td>', re.DOTALL)
+        result = info_re.findall(html)
+
+        def candidate_duration(id, title, h, m, s):
+            return float(h)*3600 + float(m)*60 + float(s)
+
+        def diff_candidate(id, title, h, m, s):
+            return abs(file_duration - candidate_duration(id, title, h, m, s))
+            
+        def is_candidate(id, title, h, m, s):            
+            return diff_candidate(id, title, h, m, s) <= 30
+
+        def cmp_candidates(a, b):
+            return cmp(diff_candidate(*a), diff_candidate(*b))
+            
+        candidates = filter(lambda tpl: is_candidate(*tpl), result)
+
+        if len(candidates) == 0:
+            print >> sys.stderr, "WARNING: Can't find suitable chapter entry."
+            return
+        elif len(candidates) == 1:
+            info = candidates[0]
+        elif len(candidates) > 1:
+            candidates.sort(cmp_candidates)
+            if diff_candidate(*candidates[0]) <= 2.0:
+                info = candidates[0]
+            else:
+                print
+                print "Found more than one suitable entry in chapterdb.org for"
+                print
+                print "'"+title+"'",
+                print "(%02i:%02i:%02i)" % (int(h), int(m), int(s)),
+                print "please choose:"
+                print
+                for counter, (id, title, h, m, s) in enumerate(candidates):
+                    print "%i:" % counter,
+                    print "(%02i:%02i:%02i)" % (int(h), int(m), int(s)),
+                    print title
+                print
+
+                print "Enter number or 'x' to cancel chapter writing [0]:",
+                answer = raw_input()
+                if answer == "":
+                    answer = "0"
+                elif answer == "x":
+                    return
+
+                answer = int(answer)
+                info = candidates[answer]
+
+        id = info[0]
+
+        chapters_txt_url = "http://chapterdb.org/Home/Download/%s?type=txt" % id
+        chapters_txt = urllib.urlopen(chapters_txt_url).read()
+        
+        open(chapter_file_name(outfn), "w").write(chapters_txt)
+    
+def write_chapters(outfn, metadata):
+    if not os.path.exists(chapter_file_name(outfn)):
+        download_chapter_file(outfn, metadata)
+        
+    if os.path.exists(chapter_file_name(outfn)):
+        # The download may fail!
+        run('mp4chaps -i "%s"' % ( outfn, ))
+        
+def seconds_to_timecode(seconds):
+    i = int(seconds)
+    hours = i / 3600
+    minutes = (i % 3600) / 60
+    secs = i % 60
+    fraction = seconds - float(i)
+    
+    ret = "%02i:%02i:%02i.%f" % ( hours, minutes, secs, fraction, )
+    return ret
+        
+def analyze_mkv_file(fn, outfn, metadata):
+    """
+    This will analythe ffmpeg's output for an mkv file and set options
+    accordingly. Options specified by the user on the command line
+    take precidence.
+    """
+    # Stream #0:0(eng): Video: h264 (High), yuv420p, 1920x1040,
+    #       SAR 1:1 DAR 24:13, 23.98 fps, 23.98 tbr, 1k tbn, 47.95 tbc (default)
+    # Stream #0:1(eng): Audio: dts (DTS), 48000 Hz, 5.0(side), fltp,
+    #       1536 kb/s (default)
+    # Metadata:
+    #   title           : 3/2
+    # Stream #0:2(jpn): Audio: dts (DTS), 48000 Hz, 5.0(side), fltp, 1536 kb/s
+    # Metadata:
+    #   title           : 3/2    
+    # Chapter #0.0: start 0.000000, end 435.184744
+    #  Metadata:
+    #    title           : Chapter 1
+    #  Chapter #0.1: start 435.184744, end 828.285789
+    #  Metadata:
+    #    title           : Chapter 2    
+    chapter_re = re.compile(
+        r"Chapter #(\d+)\.(\d+): start ([0-9\.]+), end ([0-9\.]+)(?:\n"
+        "\s+Metadata:\n"
+        "\s+title\s*:\s*(.*)\n)?")
+
+    stderr = ffmpeg_info(fn)
+
+    reaudio = False
+    streams = stream_re.findall(stderr)
+    if len(options.soundtracks) == 0:        
+        for infileno, trackno, lang, type, format in streams:
+            if type == "Audio":
+                options.soundtracks.append("%s=%i" % ( lang, int(trackno), ))
+
+                if format == "dts":
+                    reaudio = True
+
+    
+    chapters = chapter_re.findall(stderr)
+    if len(chapters) > 0:
+        fn = chapter_file_name(outfn)
+        if not os.path.exists(fn):
+            # Write the chapters file
+            fp = open(fn, "w")
+            for idx, (infileno, trackno,
+                      start, end, title) in enumerate(chapters):
+                print >> fp, "CHAPTER%02i=%s" % (
+                    idx+1, seconds_to_timecode(float(start)),)
+                if title is not None:
+                    print >> fp, "CHAPTER%02iNAME=%s" % ( idx+1, title, )
+    if reaudio:
+        options.mode = "reaudio"
+    else:
+        options.mode = "copy"
+
+
+def aac_codec_name():
+    p = subprocess.Popen(["ffmpeg", "-codecs",], stdout=subprocess.PIPE)
+    stdout, stderr = p.communicate()
+
+    if "libfaac" in stdout:
+        return [ "libfaac", ]
+    else:
+        return [ "aac", "-strict", "-2", ]
+
+def run_ffmpeg(fn, outfn, metadata):
+    # Get information on streams in the input file
+    stderr = ffmpeg_info(fn)
+
+    stream_type_by_no = {}
+    first_audio_stream_no = None
+    streams = stream_re.findall(stderr)
+    for infileno, trackno, lang, type_, format in streams:
+        trackno = int(trackno)
+        stream_type_by_no[trackno] = type_
+
+        if type_ == "Audio":
+            first_audio_stream_no = trackno
+
+    # Put together an ffmpeg command.
+    ffmpeg = [ ]
+
+    if options.nice:
+        ffmpeg += [ "nice", "-n", "10", ]
+    
+    ffmpeg += [ options.ffmpeg, "-y", "-threads", options.threads, "-i", fn, ]
+
+    if options.time:
+        ffmpeg.append("-t")
+        ffmpeg.append(options.time) 
+
+    for option in options.ffmpeg_options:
+        if "=" in option:
+            option, value = split(option, "=")
+            ffmpeg.append("-" + option)
+            ffmpeg.append(value)
+        else:
+            ffmpeg.append("-" + option)
+            
+        
+    if options.mode == "copy":
+        codecs = [ "-codec:v", "copy", "-codec:a", "copy", ]
+        options.twopass = False
+    elif options.mode == "sd":
+        if options.twopass:
+            b = "1300k"
+            bt = "600k"
+        else:
+            b = "1800k"
+            bt = "1000k"
+            
+        codecs = [ "-codec:v:0", "libx264", "-b", b, "-bt:v", bt,
+                   "-filter:v", "yadif", # == -deinterlace
+                   "-codec:a",] + aac_codec_name()
+        if options.stereo:
+            codecs += [ "-b:a", "128k", "-ac", "2", ]
+        else:
+            codecs += [ "-b:a", "512k", "-ac", "5", ]
+        metadata["hdvideo"] = "0"
+    elif options.mode == "avi1500":            
+        codecs = [ "-codec:v:0", "libx264",
+                   "-b:v", "1500k",
+                   # "-filter:v", "yadif", # == -deinterlace
+                   # Thse should become options.
+                   "-preset", "slow",
+                   #"-tune", "animation",                   
+                   "-codec:a",] + aac_codec_name()
+        codecs += [ "-b:a", "128k", "-ac", "2", ]
+        metadata["hdvideo"] = "0"
+    elif options.mode == "hd":
+        if options.twopass:
+            b = "6000k"
+            bt = "3000k"
+        else:
+            b = "10000k"
+            bt = "4000k"
+            
+        codecs = [ "-codec:v:0", "libx264", "-b:v", b, "-bt:v", bt,
+                       #"-filter:v", "yadif", # == -deinterlace
+                       "-codec:a",] + aac_codec_name()
+        if options.stereo:
+            codecs += [ "-b:a", "128k", "-ac", "2", ]
+        else:
+            codecs += [ "-b:a", "512k", "-ac", "5", ]
+        metadata["hdvideo"] = "1"
+    elif options.mode == "recodehd":
+        codecs = [ "-codec:v:0", "libx264", "-b:v", "10000k", "-bt:v", "4000k",
+                   "-codec:a", "copy", ]
+        metadata["hdvideo"] = "1"
+    elif options.mode == "reaudio":
+        codecs = [ "-codec:v:0", "copy" , "-codec:a",] + aac_codec_name()
+        
+        if options.stereo:
+            codecs += [ "-b:a", "128k", "-ac", "2", ]
+        else:
+            codecs += [ "-b:a", "512k", "-ac", "5", ]
+            
+        options.twopass = False
+                                  
+    video = [ "-map", "0:v:0", ]
+    
+
+    audio = []
+    audio_tracks_picked = set()
+    for idx, spec in enumerate(options.soundtracks):
+        lang, no = soundtrack_option_re.match(spec).groups()
+
+        if no == "only":
+            if first_audio_stream_no is None:
+                raise Exception("%s does not contain audio tracks." % fn)
+            else:
+                no = first_audio_stream_no
+        else:
+            no = int(no)
+
+        # Check for validity
+        if stream_type_by_no[no] != "Audio":
+            msg = "Track %s trak %i for language %s is not an audio track." % (
+                fn, no, lang,)
+            error_in_track_assignment(fn, msg)
+
+        if no in audio_tracks_picked:
+            error_in_track_assignment(
+                fn, "Audio track %i chosen more than once." % no)
+            audio_tracks_picked.add(no)
+        
+        audio += [ "-metadata:s:a:%i" % int(idx),
+                   "language=%s" % lang,
+                   "-map", "0:%i,0:v:0" % (int(no)), ]
+         
+    output = [ outfn, ]
+
+    if options.twopass:
+        run(ffmpeg + codecs + video + [ "-pass", "1", "-an", ] + output)
+        run(ffmpeg + codecs + video + [ "-pass", "2", ] + audio + output)
+    else:
+        run(ffmpeg + codecs + video + audio + output)
+
+    
+def work(fn, metadata):
+    if options.mode == "metadata":
+        outfn = fn
+    else:
+        if fn == "-":
+            title = metadata.get("song", "TITLE")
+            date = metadata.get("date", "")
+            if not date:
+                year = metadata.get("year", "UNKNOWN")
+            else:
+                year = split(date, "-")[0]
+
+            outfn = os.path.join(options.outdir,
+                                 "%s (%s).m4v" % (title, year,))
+        else:
+            basename = os.path.basename(fn)
+            outfn = os.path.join(options.outdir, new_ext(basename, "m4v"))
+
+        if options.mode == "mkvcopy":
+            analyze_mkv_file(fn, outfn, metadata)
+            
+        run_ffmpeg(fn, outfn, metadata)
+        
+    if metadata: write_metadata(metadata, outfn)    
+    if options.art: write_art(outfn)
+
+    if metadata["type"] == "movie":
+        write_chapters(outfn, metadata)
+
+    report("Done converting " + fn)
+
+def which(fn):
+    for path in os.environ["PATH"].split(":"):
+        if path == "": path = "."
+        try:
+            if fn in os.listdir(path):
+                return os.path.join(path, fn)
+        except OSError:
+            pass
+        
+    fn = os.path.abspath(fn)
+    if os.path.exists(fn):
+        return fn
+    
+    return None
+    
+class my_option_parser(optparse.OptionParser):
+    def format_description(self, formatter):
+        return self.description
+    
+def main():
+    global options
+    
+    usage = [ ]
+
+    usage.append("Meta info field names: (use with -m)")
+    for name, type, help in meta_tags:
+        usage.append("%15s %s %s" % ( ljust(name, 12), type, help, ))
+    usage.append("")
+    usage = join(usage, "\n")
+                     
+    
+    op = my_option_parser(usage="usage: %prog [options] [-h] <input file>",
+                          description=usage)
+    
+    gr = optparse.OptionGroup(op, "Modes")
+    gr.add_option("--hd", dest="mode", action="store_const", const="hd",
+                  help="Use codecs settings suitable for HD input.")
+    gr.add_option("--sd", dest="mode", action="store_const", const="sd",
+                  help="Use codecs settings suitable for SD input.")
+    gr.add_option("--copy", dest="mode", action="store_const", const="copy",
+                  help="Copy the input file's streams, don't reencode.")
+    gr.add_option("--metadata", dest="mode", action="store_const",
+                  const="metadata",
+                  help="Don't convert anything, just acquire metadata and "
+                  "write them to the input file.")
+    gr.add_option("--recodehd", dest="mode", action="store_const",
+                  const="recodehd",
+                  help="Recode HD video, copy the audio.")
+    gr.add_option("--reaudio", dest="mode", action="store_const",
+                  const="reaudio",
+                  help="Recode audio, copy the video stream.")
+    gr.add_option("--chapters", dest="mode", action="store_const",
+                  const="chapters",
+                  help="Attempt to download a list of chapters from "
+                  "chapterdb.org and use mp4chaps to apply it to the output "
+                  "file.")
+    gr.add_option("--mkvcopy", dest="mode", action="store_const",
+                  const="mkvcopy",
+                  help="Copy tracks from an mkv file over to a m4v file "
+                  "without conversion. This will add metadata and artwork "
+                  "as if the file had been converted my movierip. It will "
+                  "try to preserve as much of the original file as posible. "
+                  "If you specify soundtracks on the command line, no "
+                  "automatic detection will be attempted. Likewise, if you "
+                  "specify a chapters file, your file will be used.")
+    gr.add_option("--avi1500", dest="mode", action="store_const",
+                  const="avi1500",
+                  help="Convert an SD media file to m4v with 1500k for "
+                  " the video track and 128k stereo audio.")
+    op.add_option_group(gr)
+    
+    gr = optparse.OptionGroup(op, "ffmpeg options")
+    gr.add_option("-t", dest="time", help="How many hh:mm:ss so convert")
+    gr.add_option("--ffmpeg", dest="ffmpeg", default="ffmpeg",
+                  help="Name of the ffmpeg executable")
+    gr.add_option("-f", dest="ffmpeg_options", default=[], action="append",
+                  help="Append/replace options to ffmpeg. Use "
+                       "-f <name>=<option> "
+                       "to append -<name> <option> to the command line. The "
+                       "script will attempt to place the option in the correct "
+                       "position.")
+    gr.add_option("-2", dest="twopass", action="store_true", default=True,
+                  help="Make two x264 passes, that is: run ffmpeg twice.")
+    op.add_option_group(gr)
+    
+    gr = optparse.OptionGroup(op, "Sound options")
+    gr.add_option("-d", dest="deu_no", help="Number of German soundtrack",
+                  default=None)
+    gr.add_option("-e", dest="eng_no", help="Number of English soundtrack",
+                  default=None)
+    gr.add_option("--soundtrack", dest="soundtracks", action="append",
+                  help="Add soundtrack in arbitrary language as LANG=#, where"
+                  "LANG is the 3-letter language name and # the soundtracks"
+                  "number.", default=[])
+    gr.add_option("--stereo", dest="stereo", action="store_true",
+                  help="Convert to stereo audio.", default=False)
+    op.add_option_group(gr)
+    
+    # gr = optparse.OptionGroup(op, "Subtitle options")
+    # gr.add_option("-D", dest="deu_srt_fn", help="German subtitle (srt) file",
+    #               default=None)
+    # gr.add_option("-E", dest="eng_srt_fn", help="English subtitle (srt) file",
+    #               default=None)
+    # gr.add_option("--subtitle", dest="subtitles", action="append",
+    #               help="Add subtitle track for arbitrary language LANG=<fn>, "
+    #               "where LANG is the 3-letter language name and <fn> the"
+    #               "name or an srt file.", default=[])
+    # op.add_option_group(gr)
+    
+    gr = optparse.OptionGroup(op, "Metainfo options")
+    gr.add_option("-m", dest="metainfo", action="append", default=[],
+                  help="Use mp4tags to add metadata to the output file "
+                       "as <name>=<value>. For field names see above.")
+    gr.add_option("-a", dest="art", help="Cover art image to add",
+                  default=None)
+    gr.add_option("-n", dest="nfo_fn", default=None,
+                  help=".nfo file name (if different from vob)")
+    gr.add_option("--choose", dest="choose", default=None,
+                  help="When promting for a specific movie after metadata "
+                  "download, CHOOSE this index.")
+    gr.add_option("--german", dest="german", default=False,
+                  action="store_true",
+                  help="Download German metainfo, if available.")
+    op.add_option_group(gr)
+    
+    op.add_option("--debug", dest="debug", action="store_true",
+                  help="Don't run anything, just print out command lines")
+    op.add_option("--growl", dest="growl", action="store_true",
+                  default=which("growlnotify") is not None,
+                  help="Use growl notifyer to report completion or errors.")
+    op.add_option("-o", dest="outdir", help="Output directory",
+                  default=os.getenv("MOVIERIP_OUTDIR", "."))
+    op.add_option("-N", dest="nice", action="store_true",
+                  help="Be nice to other processes.")
+    op.add_option("-T", dest="threads", default="4",
+                  help="Run this many concurrent threads of ffmpeg (4).")
+    
+
+    log.add_option(op)
+    # debug.add_option(op) -- Handled separately, because it would conflict -d.
+    
+    ( options, args, ) = op.parse_args()
+    movierip.options = options
+
+    if op.german:
+        movierip.tmdb.set_locale("de")
+    
+    if which(options.ffmpeg) is None:
+        op.error("Can't find %s on the path." % options.ffmpeg)
+
+    for a in ( "mp4tags", "mp4art", "mp4chaps", ):
+        if which(a) is None:
+            op.error("Can't find %s on the path (download mp4v2 from "
+                     "http://code.google.com/p/mp4v2/" % a)
+
+    if len(args) != 1:
+        op.error("Please specify an input file on the command line.")
+    else:
+        fn = args[0]
+
+    if fn != "-" and not os.path.exists(fn):
+        op.error("Input file %s does not exist." % repr(fn))
+
+
+    if options.mode == "chapters":
+        # Shortcut. If we're run in chapters mode, we don't download metadata.
+        write_chapters(fn, {})
+        return
+        
+    if options.mode is None:
+        if fn == "-":
+            name, ext = "", ""
+        else:
+            name, ext = rsplit(fn, ".", 1)
+            
+        ext = lower(ext)
+        if ext == "vob":
+            options.mode = "sd"
+        elif ext == "m2ts":
+            options.mode = "hd"
+        elif ext == "mkv":
+            options.mode = "mkvcopy"
+        else:
+            op.error("Please specify a mode on the command line.")
+
+
+    if options.time:
+        time_re = re.compile("[0-8:]+")
+        if not time_re.match(options.time):
+            op.error("Please specify time as hh:mm:ss")
+            
+    def lang_spec(lang, track):
+        if track == "only":
+            return "%s=only" % lang
+        else:
+            try:
+                track = int(track)
+            except ValueError:
+                op.error("German and English soundtrack numbers "
+                         "must be integer or 'only'.")
+                
+            return "%s=%i" % ( lang, int(track), )
+        
+    if options.deu_no is not None:
+        options.soundtracks.insert(0, lang_spec("deu", options.deu_no))
+    if options.eng_no is not None:
+        options.soundtracks.insert(0, lang_spec("eng", options.eng_no))
+
+    if (options.deu_no and options.eng_no) and \
+            options.deu_no == options.eng_no:
+        op.error("German and English soundtrack can't have the same index.")
+
+    if len(options.soundtracks) == 0 and \
+            not options.mode in ( "metadata", "mkvcopy", ):
+        op.error("No soundtrack has been chosen.")
+
+    for s in options.soundtracks:
+        match = soundtrack_option_re.match(s)
+        if match is None:
+            op.error("Please specify soundtracks as indicated by --help.")
+
+    metadata = set_once_dict()
+    for metainfo in options.metainfo:
+        try:
+            name, value = split(metainfo, "=", 1)
+        except ValueError:
+            op.error("The syntax for meta-info switches is: -m <name>=<value>")
+            
+        metadata[name] = strip(value)
+
+    type = metadata.get("type", None)
+
+    if not type:
+        if os.path.basename(sys.argv[0]) == "tvshowrip":
+            metadata["type"] = type = "tvshow"
+        else:
+            metadata["type"] = type = "movie"
+
+    if options.nfo_fn is None:
+        if fn != "-":
+            nfo_fn = new_ext(fn, "nfo")
+        else:
+            nfo_fn = None
+    else:
+        nfo_fn = options.nfo_fn
+    
+    if metadata.has_key("show"):
+        # If the year has been passed in the show's name, separate
+        # the two.
+        show_and_year_re = re.compile(r"\s*(?P<show>.*?)\((?P<year>\d+)\)\s*")
+        match = show_and_year_re.match(metadata["show"])
+        if match is not None:
+            metadata.set("show", match.groupdict()["show"])
+            metadata.set("year", match.groupdict()["year"])
+        
+    if nfo_fn and os.path.exists(nfo_fn):
+        metadata.update(read_nfo(nfo_fn))
+    else:
+        if type == "movie":
+            song = metadata.get("song", None)
+            metadata.update(download_movie_metadata(fn, song))
+        elif type == "tvshow":
+            metadata.update(download_tvshow_metadata(fn, metadata))
+
+    # Print out the metadata, ordered by key.
+    items = metadata.items()
+    items.sort(lambda a, b: cmp(a[0], b[0]))
+    print >> log
+    for name, value in items:
+        name = str(name)
+        value = str(value)
+        print >> log, "%20s %s" % ( ljust(name, 20), str(value), )
+    print >> log
+            
+    # Copy the metadata from the command line again, so the user is
+    # always able to overwrite automatically generated infos.
+    #for metainfo in options.metainfo:
+    #    name, value = split(metainfo, "=", 1)
+    #    metadata[name] = value
+    # NOT NEEDED FOR set_once_dict.
+        
+    if options.debug: debug.verbose = True
+
+
+    if type == "movie":
+        required_fields = ("song", "year", "description", )
+    elif type == "tvshow":
+        required_fields = ("show", "song", "year",
+                           "season", "episode",
+                           "description", )        
+    else:
+        assert type in media_type_by_name.keys(), KeyError
+        required_fields = ()
+
+    for field in required_fields:
+        if not metadata.get(field, None):
+            op.error("Please specify -m %s=..." % field)
+
+    work(fn, metadata)
+
+if __name__ == "__main__":    
+    main()

@@ -1,0 +1,140 @@
+#!/usr/bin/env python
+# -*- coding: utf-8; mode: python; -*-
+
+##  Copyright 2016 by Diedrich Vorberg <diedrich@tux4web.de>
+##
+##  All Rights Reserved
+##
+##  For more Information on orm see the README file.
+##
+##  This program is free software; you can redistribute it and/or modify
+##  it under the terms of the GNU General Public License as published by
+##  the Free Software Foundation; either version 3 of the License, or
+##  (at your option) any later version.
+##
+##  This program is distributed in the hope that it will be useful,
+##  but WITHOUT ANY WARRANTY; without even the implied warranty of
+##  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+##  GNU General Public License for more details.
+##
+##  You should have received a copy of the GNU General Public License
+##  along with this program; if not, write to the Free Software
+##  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+##
+##  I have added a copy of the GPL in the file LICENSE
+
+"""\
+This program is designed to re-encode MKV files created by MakeMKV that have
+been copied off of a Blue Ray Disk. The transfer of metadata is left to ffmpeg.
+Only audio codec and bitrate are changed.
+"""
+
+import sys, os, os.path as op, re
+from t4.utils import run
+from string import *
+
+stream_re = re.compile(u"Stream #0:(\d+)\(([a-z]+)\): (Video|Audio): (.*)")
+settings_separator_re = re.compile(u"\s*,\s*")
+
+def aac_codec_name():
+    (stdout, stderr), exitcode = run(["ffmpeg", "-codecs",],
+                                     creates_output=True)
+
+    if "libfaac" in stdout:
+        return [ "libfaac", ]
+    else:
+        return [ "aac", "-strict", "-2", ]
+
+def add_quotes_q(s):
+    s = replace(s, '"', "'")
+    
+    if " " in s: return '"' + s + '"'
+    else: return s
+    
+def shell_command(arguments):
+    return join(map(add_quotes_q, arguments), " ")
+
+def debug(arguments):
+    cmd = shell_command(arguments)
+    print cmd
+    
+    retval = os.system(cmd)
+    if retval:
+        print >> sys.stderr, "Command execution failed:", cmd
+        sys.exit(retval)
+
+processor_re = re.compile(u"processor\s*: (\d+)")
+def number_of_cpus():
+    if op.exists("/proc/cpuinfo"):
+        info = open("/proc/cpuinfo").read()
+        result = processor_re.findall(info)
+        result = map(lambda (id,): int(id), result)
+        return max(result)
+    elif op.exists("/Library"):
+        (out, err), stat = run("sysctl -n hw.ncpu", creates_output=True)
+        return int(out)
+    
+def process(ffmpeg_arguments, filename):
+    ((stdout, stderr,), retval) = run(["ffmpeg", "-i", filename])
+
+    result = stream_re.findall(stderr)
+
+    ffmpeg = [ "ffmpeg", "-y",
+               "-threads", str(number_of_cpus()),
+               "-i", filename, ] + ffmpeg_arguments
+    
+    video = [ "-map", "0:v:0",
+              "-codec:v:0", "libx264", "-b:v", "6000k", "-bt:v", "3000k",
+              "-filter:v", "yadif", # == -deinterlace
+              "-codec:a",] + aac_codec_name()
+
+    audio = []
+    
+    name, ext = op.splitext(filename)
+    output = [ name + ".m4v", ]
+    
+    for stream_no, lang, medium, settings in result:
+        stream_no = int(stream_no)
+        settings = settings_separator_re.split(settings)
+
+        if medium == "Audio":
+            audio += [ "-map", "0:%i,0:v:0" % (stream_no), ]
+            
+            if "stereo" in settings:
+                audio += [ "-b:a", "128k", "-ac", "2", ]
+            elif "5.1(side)" in settings:
+                audio += [ "-b:a", "512k", "-ac", "5", ]
+            elif "6.1" in settings:
+                audio += [ "-b:a", "620k", "-ac", "5", ]
+            else:
+                err = "Can’t tell which audio bitrate to use with " + join(
+                    settings, ", ")
+                raise ValueError(err)
+        elif medium == "Video":
+            pass
+        else:
+            raise ValueError("Don’t know what to do with “%s” stream." % medium)
+
+    debug(ffmpeg + video + [ "-pass", "1", "-an", ] + output)
+    debug(ffmpeg + video + [ "-pass", "2", ] + audio + output)
+        
+
+def main():
+    arguments = sys.argv[1:]
+    arguments.reverse()    
+    filenames = []
+    ffmpeg_arguments = []
+
+    while arguments:
+        arg = arguments.pop()
+        
+        if arg.startswith("-"):
+            ffmpeg_arguments.append(arg)
+            ffmpeg_arguments.append(arguments.pop())
+        else:
+            filenames.append(arg)
+    
+    for filename in filenames:
+        process(ffmpeg_arguments, filename)
+
+main()
