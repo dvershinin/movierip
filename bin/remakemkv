@@ -65,10 +65,14 @@ def debug(arguments):
 
 processor_re = re.compile(u"processor\s*: (\d+)")
 def number_of_cpus():
-    info = open("/proc/cpuinfo").read()
-    result = processor_re.findall(info)
-    result = map(lambda (id,): int(id), result)
-    return max(result)
+    if op.exists("/proc/cpuinfo"):
+        info = open("/proc/cpuinfo").read()
+        result = processor_re.findall(info)
+        result = map(lambda (id,): int(id), result)
+        return max(result)
+    elif op.exists("/Library"):
+        (out, err), stat = run("sysctl -n hw.ncpu", creates_output=True)
+        return int(out)
     
 def process(ffmpeg_arguments, filename):
     ((stdout, stderr,), retval) = run(["ffmpeg", "-i", filename])

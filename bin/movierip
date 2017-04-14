@@ -29,6 +29,8 @@ from cStringIO import StringIO
 from t4.debug import log, debug
 from t4.web.typography import improve_typography_unicode, normalize_whitespace
 
+import movierip
+
 options = None
 
 soundtrack_option_re = re.compile(r"([a-z]{3})=(\d+|only)")
@@ -81,146 +83,12 @@ def report(msg):
     else:
         print >> log, msg
 
-def name_and_year(filename):
-    """
-    Attempt to parse a filename. Return a tuple a ( name, year, ).
-    The year may be None, otherwise it's an integer.
-    """
-    filename_re = re.compile(r"(.*?)\.(\d+)\.\d+p\..*")
-    match = filename_re.match(filename)
-    if match is not None:
-        name, year = match.groups()
-        name = replace(name, ".", " ")
-        return ( name, int(year), )
-        
-    filename_re = re.compile(r"(.*?)\((\d+)\)\..*")
-    match = filename_re.match(filename)
-    if match is not None:
-        name, year = match.groups()
-        return ( strip(name), int(year),  )
-    else:
-        try:
-            name, ext = split(filename, ".", 1)
-        except ValueError:
-            name = filename
-        
-        return ( strip(name), None, )
 
-
-def present_movie(idx, movie):
-    print idx,
-    if type(movie.releasedate) == types.UnicodeType:
-        year = movie.releasedate
-        
-    elif not movie.releasedate:
-        year = "unknown"
-    else:
-        year = str(movie.releasedate.year)
-        
-    print "%s (%s)" % ( movie.title, year, )
-    
 def download_movie_metadata(fn, title=None):
     if title is None:
-        title = fn
-
-    try:
-        import tmdb3 as tmdb
-    except ImportError:
-        print >> sys.stderr, \
-            ("Can't import tmdb Python module. Please install.\n"
-             "E.g by running 'easy_install tmdb3' on the command line.\n"
-             "See http://www.themoviedb.org/documentation/api on how to\n"
-             "obtain the required API key.")
-        sys.exit(255)
+        title, ext = os.path.splitext(os.path.basename(fn))
         
-    tmdb.set_key("a888a20b801aeefde1ba41a932898d48")
-
-    name, year = name_and_year(title)
-
-    result = tmdb.searchMovie(name)
-    
-    movies = list(result)
-
-    if year is not None:
-        def year_match(movie):
-            if movie is None:
-                return False
-            else:
-                if not movie.releasedate:
-                    return False
-                else:
-                    y = movie.releasedate.year
-                    return y == year or y == year - 1 or y == year + 1
-        
-        movies = filter(year_match, movies)
-
-    if len(movies) == 0:
-        print >> sys.stderr, "No movie found:", name
-        sys.exit(1)
-    elif len(movies) > 1:
-        
-        movies.sort(lambda a, b: cmp(str(a.releasedate), str(b.releasedate)))
-        
-        print        
-        for idx, movie in enumerate(movies):
-            present_movie(idx, movie)
-        print
-        
-        if options.choose is None:
-            if fn == "-":
-                print "Use --choose to select one of the movies above."
-                sys.exit(1)
-            else:
-                print "Enter index [0]:",
-                i = strip(raw_input())
-                if i == "":
-                    idx = 0
-                else:
-                    idx = int(i)
-        else:
-            idx = int(options.choose)
-    else:
-        idx = 0
-
-    movie = movies[idx]
-
-    if movie.tagline is None:
-        movie.tagline = ""
-        
-    if movie.overview is None:
-        movie.overview = ""
-
-    if strip(movie.tagline):
-        description = movie.tagline + \
-            u" — " + movie.overview
-    else:
-        description = movie.overview
-
-    # Download artwork
-    if not options.art:
-        url = movie.poster.geturl()
-        rest, artfn = rsplit(url, "/", 1)
-        artpath = os.path.join("/tmp", artfn)
-
-        if not os.path.exists(artpath):
-            jpeg = urllib.urlopen(url).read()
-            fp = open(artpath, "w")
-            fp.write(jpeg)
-            fp.close()
-            
-        options.art = artpath
-
-    info = { "song": movie.title,
-             "description": description, }
-    
-    genres = movie.genres
-    if len(genres) > 0:
-        info["genre"] = genres[0].name
-        
-    if movie.releasedate:
-        info["year"] = str(movie.releasedate.year)
-
-    return info
+    return movierip.info_from_tmdb_movie(movierip.get_tmdb_movie_for(title))
     
 def download_tvshow_metadata(fn, metadata):
     try:
@@ -536,7 +404,7 @@ def download_chapter_file(outfn, metadata):
         if metadata:
             title = metadata["song"]
         else:
-            title, year = name_and_year(outfn)
+            title, year = movierip.name_and_year(outfn)
             title = strip(replace(title, "(HD)", ""))
             
         # Make a chapterdb query
@@ -990,7 +858,8 @@ def main():
     # debug.add_option(op) -- Handled separately, because it would conflict -d.
     
     ( options, args, ) = op.parse_args()
-
+    movierip.options = options
+    
     if which(options.ffmpeg) is None:
         op.error("Can't find %s on the path." % options.ffmpeg)
 
@@ -1143,5 +1012,6 @@ def main():
             op.error("Please specify -m %s=..." % field)
 
     work(fn, metadata)
-    
-main()
+
+if __name__ == "__main__":    
+    main()
