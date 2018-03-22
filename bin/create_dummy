@@ -114,8 +114,9 @@ def create_dummy_frame(cover, disktype):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("title", type=str, nargs=1,
-                    help="Movie title (with year in parenthesese) or tmdb id")
+    ap.add_argument("titles", type=str, nargs="+",
+                    help="One or more movie title "
+                    "(with year in parenthesese) or tmdb id")
     ap.add_argument("-a", dest="artwork",
                     metavar="filename", type=str, default=None,
                     help="Filepath to a poster as .jpg file")
@@ -129,78 +130,79 @@ def main():
     args = ap.parse_args()
     debug.verbose = args.log
 
-    movie_title = args.title[0]
-
     os.chdir(op.join(os.getenv("HOME"), "Desktop"))
-    
-    debug("Getting movie info from tmdb for “%s”" % movie_title)
+
     if args.german:
         movierip.tmdb.set_locale("de")
-    movie = movierip.get_tmdb_movie_for(movie_title)    
-    debug("Found", repr(movie))
     
-    poster = None
+    for movie_title in args.titles:
+        debug("Getting movie info from tmdb for “%s”" % movie_title)
+        movie = movierip.get_tmdb_movie_for(movie_title)    
+        debug("Found", repr(movie))
 
-    if args.artwork:
-        poster = Image.open(args.artwork)
-    elif movie.poster:
-        url = movie.poster.geturl("original")
-        poster_jpeg = urllib.urlopen(url).read()
+        poster = None
 
-        poster = Image.open(StringIO(poster_jpeg))
-    else:
-        raise Exception("No artwork for the poster provided.")
+        if args.artwork:
+            poster = Image.open(args.artwork)
+        elif movie.poster:
+            url = movie.poster.geturl("original")
+            poster_jpeg = urllib.urlopen(url).read()
 
-    cover = create_cover_image(poster, args.disktype)
-    dummy_frame = create_dummy_frame(cover, args.disktype)
+            poster = Image.open(StringIO(poster_jpeg))
+        else:
+            raise Exception("No artwork for the poster provided.")
 
-    sl = slug()
-    cover_png_path = op.join(tempfile.gettempdir(), "cover_%s.jpg" % sl)
-    #cover_on_white = with_white_background(cover)    
-    cover.save(cover_png_path, "PNG")
-    debug("Wrote cover PNG to", cover_png_path)
-    
-    dummy_frame_path = op.join(tempfile.gettempdir(), "dummy_frame_%s.png" % sl)
-    dummy_frame.save(dummy_frame_path, "PNG")
-    debug("Wrote dummy frame to", dummy_frame_path)
+        cover = create_cover_image(poster, args.disktype)
+        dummy_frame = create_dummy_frame(cover, args.disktype)
 
-    dummy_movie_path = op.join(os.getenv("HOME"), "Desktop",
-                               "%s.m4v" % movie.id)
-    
-    debug("Starting ffmpeg to create", dummy_movie_path)
-    cmd = "ffmpeg -loop 1 -i %s -c:v libx264 -t 15 -pix_fmt yuv420p %s" % (
-        dummy_frame_path, dummy_movie_path)
-    debug(cmd)
-    run(cmd)    
+        sl = slug()
+        cover_png_path = op.join(tempfile.gettempdir(), "cover_%s.jpg" % sl)
+        #cover_on_white = with_white_background(cover)    
+        cover.save(cover_png_path, "PNG")
+        debug("Wrote cover PNG to", cover_png_path)
 
-    fp = open("%i.chapters.txt" % movie.id, "w")
-    print >> fp, "CHAPTER01=00:00:00.000"
-    print >> fp, "CHAPTER01NAME=Main Titles"
-    fp.close()
+        dummy_frame_path = op.join(tempfile.gettempdir(),
+                                   "dummy_frame_%s.png" % sl)
+        dummy_frame.save(dummy_frame_path, "PNG")
+        debug("Wrote dummy frame to", dummy_frame_path)
 
-    if args.german:
-        gr = "--german"
-    else:
-        gr = ""
-        
-    cmd = "movierip --metadata -a %s --choose 0 %s %s" % (
-        cover_png_path, gr, dummy_movie_path,)
-    debug("Running movierip to download the metadata:", cmd)
-    run(cmd)
+        dummy_movie_path = op.join(os.getenv("HOME"), "Desktop",
+                                   "%s.m4v" % movie.id)
 
-    os.unlink(cover_png_path)
-    os.unlink(dummy_frame_path)
-    
-    if op.exists("%i.chapters.txt" % movie.id):
-        os.unlink("%i.chapters.txt" % movie.id)
+        debug("Starting ffmpeg to create", dummy_movie_path)
+        cmd = "ffmpeg -loop 1 -i %s -c:v libx264 -t 15 -pix_fmt yuv420p %s" % (
+            dummy_frame_path, dummy_movie_path)
+        debug(cmd)
+        run(cmd)    
 
-    if movie.releasedate:
-        fn = u"%s (%s).m4v" % ( movie.title, movie.releasedate.year, )
-    else:
-        fn = movie.title
-    fn = fn.encode("utf-8")
-    
-    os.rename(dummy_movie_path, fn)
+        fp = open("%i.chapters.txt" % movie.id, "w")
+        print >> fp, "CHAPTER01=00:00:00.000"
+        print >> fp, "CHAPTER01NAME=Main Titles"
+        fp.close()
+
+        if args.german:
+            gr = "--german"
+        else:
+            gr = ""
+
+        cmd = "movierip --metadata -a %s --choose 0 %s %s" % (
+            cover_png_path, gr, dummy_movie_path,)
+        debug("Running movierip to download the metadata:", cmd)
+        run(cmd)
+
+        os.unlink(cover_png_path)
+        os.unlink(dummy_frame_path)
+
+        if op.exists("%i.chapters.txt" % movie.id):
+            os.unlink("%i.chapters.txt" % movie.id)
+
+        if movie.releasedate:
+            fn = u"%s (%s).m4v" % ( movie.title, movie.releasedate.year, )
+        else:
+            fn = movie.title
+        fn = fn.encode("utf-8")
+
+        os.rename(dummy_movie_path, fn)
     
 if __name__ == "__main__":
     main()
